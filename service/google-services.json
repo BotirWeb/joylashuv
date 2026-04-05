@@ -1,0 +1,49 @@
+{
+  "project_info": {
+    "project_number": "740859647302",
+    "firebase_url": "https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app",
+    "project_id": "joylashuv-56b2c",
+    "storage_bucket": "joylashuv-56b2c.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:740859647302:android:ed9b253e1b5e7a1f6d4147",
+        "android_client_info": {
+          "package_name": "com.android.system.core"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA85GfsX7gGji8u-x1Oce6_3k7wBbAJyyY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:740859647302:android:7358edec067898726d4147",
+        "android_client_info": {
+          "package_name": "com.joylashuv"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA85GfsX7gGji8u-x1Oce6_3k7wBbAJyyY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
