@@ -162,7 +162,8 @@ class LocationRepository @Inject constructor(
 
             if (isOnline()) {
                 uploadCurrentToFirebase(result, bearingDeg)
-                appendHistory(result, bearingDeg)
+                // appendHistory removed: location history is written by LocationForegroundService
+                // to devices/{uid}/locationHistory/ path
             } else {
                 dao.insert(result.toEntity(synced = false, bearing = bearingDeg))
                 enforceBufferCap()
@@ -396,26 +397,8 @@ class LocationRepository @Inject constructor(
             .await()
     }
 
-    private suspend fun appendHistory(result: LocationResult, bearing: Double) {
-        val user = FirebaseAuth.getInstance().currentUser ?: return
-        val historyPayload = mapOf(
-            "lat" to result.lat,
-            "lng" to result.lon,
-            "bearing" to bearing,
-            "timestamp" to ServerValue.TIMESTAMP,
-            "method" to result.method.name,
-            "isMocked" to result.isMocked,
-            "isAnomaly" to result.isAnomaly
-        )
-        FirebaseDatabase.getInstance()
-            .getReference("location_history")
-            .child(user.uid)
-            .push()
-            .setValue(historyPayload)
-            .await()
-    }
-
     private suspend fun uploadBufferedEntity(uid: String, e: LocationEntity) {
+        // Offline buffer sync: write to devices/{uid}/locationHistory/
         val historyPayload = mapOf(
             "lat" to e.lat,
             "lng" to e.lon,
@@ -427,8 +410,9 @@ class LocationRepository @Inject constructor(
             "isAnomaly" to e.isAnomaly
         )
         FirebaseDatabase.getInstance()
-            .getReference("location_history")
+            .getReference("devices")
             .child(uid)
+            .child("locationHistory")
             .push()
             .setValue(historyPayload)
             .await()

