@@ -231,35 +231,39 @@ class CourierDetailActivity : ComponentActivity() {
                         // nested fields (e.g. status) are stored as encrypted String
                         val deviceId2 = snapshot.child("deviceId").getValue(String::class.java) ?: ""
                         val deviceName2 = snapshot.child("deviceName").getValue(String::class.java) ?: ""
-                        val registeredAt = snapshot.child("registeredAt").getValue(Long::class.java) ?: 0L
+                        val registeredAt = SafeFirebaseReader.getLong(snapshot, "registeredAt")
 
                         // Parse location
-                        val locSnap = snapshot.child("location")
                         val location = try {
-                            LocationData(
-                                lat = locSnap.child("lat").getValue(Double::class.java) ?: 0.0,
-                                lng = locSnap.child("lng").getValue(Double::class.java) ?: 0.0,
-                                accuracy = locSnap.child("accuracy").getValue(Float::class.java) ?: 0f,
-                                speed = locSnap.child("speed").getValue(Double::class.java) ?: 0.0,
-                                bearing = locSnap.child("bearing").getValue(Double::class.java) ?: 0.0,
-                                altitude = locSnap.child("altitude").getValue(Double::class.java) ?: 0.0,
-                                provider = locSnap.child("provider").getValue(String::class.java) ?: "",
-                                battery = locSnap.child("battery").getValue(Int::class.java) ?: 0,
-                                timestamp = locSnap.child("timestamp").getValue(Long::class.java) ?: 0L
-                            )
+                            val locSnap = snapshot.child("location")
+                            if (locSnap.exists()) {
+                                LocationData(
+                                    lat = SafeFirebaseReader.getDouble(locSnap, "lat"),
+                                    lng = SafeFirebaseReader.getDouble(locSnap, "lng"),
+                                    accuracy = SafeFirebaseReader.getDouble(locSnap, "accuracy").toFloat(),
+                                    speed = SafeFirebaseReader.getDouble(locSnap, "speed"),
+                                    bearing = SafeFirebaseReader.getDouble(locSnap, "bearing"),
+                                    altitude = SafeFirebaseReader.getDouble(locSnap, "altitude"),
+                                    provider = SafeFirebaseReader.getString(locSnap, "provider"),
+                                    battery = SafeFirebaseReader.getInt(locSnap, "battery"),
+                                    timestamp = SafeFirebaseReader.getLong(locSnap, "timestamp")
+                                )
+                            } else null
                         } catch (e: Exception) {
                             if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "location parse error: ${e.message}") }
                             null
                         }
 
                         // Parse status — may be encrypted String or object
-                        val statusSnap = snapshot.child("status")
                         val status = try {
-                            StatusData(
-                                online = statusSnap.child("online").getValue(Boolean::class.java) ?: false,
-                                lastSeen = statusSnap.child("lastSeen").getValue(Long::class.java) ?: 0L,
-                                battery = statusSnap.child("battery").getValue(Int::class.java) ?: 0
-                            )
+                            val statusSnap = snapshot.child("status")
+                            if (statusSnap.exists()) {
+                                StatusData(
+                                    online = SafeFirebaseReader.getBoolean(statusSnap, "online"),
+                                    lastSeen = SafeFirebaseReader.getLong(statusSnap, "lastSeen"),
+                                    battery = SafeFirebaseReader.getInt(statusSnap, "battery")
+                                )
+                            } else null
                         } catch (e: Exception) {
                             if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "status parse error: ${e.message}") }
                             null
@@ -325,8 +329,8 @@ class CourierDetailActivity : ComponentActivity() {
 
             devicesRef.child(deviceId).child("trackingConfig").get()
                 .addOnSuccessListener { snapshot ->
-                    trackingEnabled = snapshot.child("trackingEnabled").getValue(Boolean::class.java) ?: true
-                    intervalSeconds = snapshot.child("intervalSeconds").getValue(Long::class.java)?.toInt() ?: 30
+                    trackingEnabled = SafeFirebaseReader.getBoolean(snapshot, "trackingEnabled")
+                    intervalSeconds = SafeFirebaseReader.getInt(snapshot, "intervalSeconds")
                 }
                 .addOnFailureListener { error ->
                     Log.e("DEBUG_DETAIL", "Failed to load tracking config: ${error.message}")

