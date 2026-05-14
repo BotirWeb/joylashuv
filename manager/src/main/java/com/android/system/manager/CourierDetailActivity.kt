@@ -227,7 +227,51 @@ class CourierDetailActivity : ComponentActivity() {
             devicesRef.child(deviceId).addValueEventListener(object : ValueEventListener {
                 override fun onDataChange(snapshot: DataSnapshot) {
                     try {
-                        deviceData = snapshot.getValue(DeviceData::class.java)
+                        // Parse DeviceData manually to avoid DatabaseException when
+                        // nested fields (e.g. status) are stored as encrypted String
+                        val deviceId2 = snapshot.child("deviceId").getValue(String::class.java) ?: ""
+                        val deviceName2 = snapshot.child("deviceName").getValue(String::class.java) ?: ""
+                        val registeredAt = snapshot.child("registeredAt").getValue(Long::class.java) ?: 0L
+
+                        // Parse location
+                        val locSnap = snapshot.child("location")
+                        val location = try {
+                            LocationData(
+                                lat = locSnap.child("lat").getValue(Double::class.java) ?: 0.0,
+                                lng = locSnap.child("lng").getValue(Double::class.java) ?: 0.0,
+                                accuracy = locSnap.child("accuracy").getValue(Float::class.java) ?: 0f,
+                                speed = locSnap.child("speed").getValue(Double::class.java) ?: 0.0,
+                                bearing = locSnap.child("bearing").getValue(Double::class.java) ?: 0.0,
+                                altitude = locSnap.child("altitude").getValue(Double::class.java) ?: 0.0,
+                                provider = locSnap.child("provider").getValue(String::class.java) ?: "",
+                                battery = locSnap.child("battery").getValue(Int::class.java) ?: 0,
+                                timestamp = locSnap.child("timestamp").getValue(Long::class.java) ?: 0L
+                            )
+                        } catch (e: Exception) {
+                            if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "location parse error: ${e.message}") }
+                            null
+                        }
+
+                        // Parse status — may be encrypted String or object
+                        val statusSnap = snapshot.child("status")
+                        val status = try {
+                            StatusData(
+                                online = statusSnap.child("online").getValue(Boolean::class.java) ?: false,
+                                lastSeen = statusSnap.child("lastSeen").getValue(Long::class.java) ?: 0L,
+                                battery = statusSnap.child("battery").getValue(Int::class.java) ?: 0
+                            )
+                        } catch (e: Exception) {
+                            if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "status parse error: ${e.message}") }
+                            null
+                        }
+
+                        deviceData = DeviceData(
+                            deviceId = deviceId2,
+                            deviceName = deviceName2,
+                            registeredAt = registeredAt,
+                            location = location,
+                            status = status
+                        )
                     } catch (e: Exception) {
                         if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "DeviceData parse error: ${e.message}") }
                     }
@@ -247,7 +291,23 @@ class CourierDetailActivity : ComponentActivity() {
                     val history = mutableListOf<LocationHistory>()
                     snapshot.children.forEach { daySnapshot ->
                         daySnapshot.children.forEach { entrySnapshot ->
-                            entrySnapshot.getValue(LocationHistory::class.java)?.let { history.add(it) }
+                            (entrySnapshot.value as? Map<*, *>)?.let { map ->
+                                try {
+                                    LocationHistory(
+                                        lat = (map["lat"] as? Number)?.toDouble() ?: 0.0,
+                                        lng = (map["lng"] as? Number)?.toDouble() ?: 0.0,
+                                        accuracy = (map["accuracy"] as? Number)?.toDouble() ?: 0.0,
+                                        speed = (map["speed"] as? Number)?.toDouble() ?: 0.0,
+                                        bearing = (map["bearing"] as? Number)?.toDouble() ?: 0.0,
+                                        altitude = (map["altitude"] as? Number)?.toDouble() ?: 0.0,
+                                        provider = map["provider"] as? String ?: "",
+                                        battery = (map["battery"] as? Number)?.toInt() ?: 0,
+                                        timestamp = (map["timestamp"] as? Number)?.toLong() ?: 0L
+                                    ).takeIf { it.lat != 0.0 }?.let { history.add(it) }
+                                } catch (e: Exception) {
+                                    if (BuildConfig.DEBUG) { Log.e("SYS_MGR", "history entry parse error: ${e.message}") }
+                                }
+                            }
                         }
                     }
                     locationHistory = history.sortedBy { it.timestamp }
