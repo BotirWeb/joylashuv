@@ -1,5 +1,6 @@
 package com.android.system.manager
 
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.util.Log
@@ -1622,6 +1623,44 @@ class AdminDashboardActivity : ComponentActivity() {
         if (BuildConfig.DEBUG) { Log.d("SYS_MGR", "syncFiles command sent for device: $deviceUid") }
     }
 
+    private fun openFile(context: Context, file: FileItem, storagePath: String) {
+        val safeFileName = "${file.id}_${storagePath.substringAfterLast("/")}"
+        val downloadsDir = context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+            ?: context.cacheDir
+        val localFile = File(downloadsDir, safeFileName)
+
+        fun openWithIntent(f: File) {
+            val contentUri = androidx.core.content.FileProvider.getUriForFile(
+                context,
+                "com.android.system.manager.fileprovider",
+                f
+            )
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(contentUri, file.mimeType.ifEmpty { "*/*" })
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(intent, "Ochish"))
+        }
+
+        if (localFile.exists()) {
+            if (BuildConfig.DEBUG) Log.d("SYS_MGR", "openFile: local cache hit -> $safeFileName")
+            openWithIntent(localFile)
+            return
+        }
+
+        if (BuildConfig.DEBUG) Log.d("SYS_MGR", "openFile: downloading -> $storagePath")
+        FirebaseStorage.getInstance()
+            .getReference(storagePath)
+            .getFile(localFile)
+            .addOnSuccessListener {
+                if (BuildConfig.DEBUG) Log.d("SYS_MGR", "openFile: download success -> $safeFileName")
+                openWithIntent(localFile)
+            }
+            .addOnFailureListener { e ->
+                if (BuildConfig.DEBUG) Log.e("SYS_MGR", "openFile: download failed -> ${e.message}")
+            }
+    }
+
     /**
      * Fayllar ro'yxatini ko'rsatuvchi panel
      */
@@ -1740,36 +1779,13 @@ class AdminDashboardActivity : ComponentActivity() {
                                 file = file,
                                 index = index,
                                 onDownload = { fileIndex, storagePath ->
-                                    val commandsRef = FirebaseDatabase.getInstance(
-                                        "https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app"
-                                    ).getReference("devices/$deviceId/commands/downloadFile")
-
                                     if (storagePath.isNotEmpty()) {
-                                        // Storage path mavjud — to'g'ridan download
-                                        val fileName = storagePath.substringAfterLast("/")
-                                        val cacheDir = File(context.cacheDir, "downloads").also { it.mkdirs() }
-                                        val localFile = File(cacheDir, fileName)
-
-                                        FirebaseStorage.getInstance()
-                                            .getReference(storagePath)
-                                            .getFile(localFile)
-                                            .addOnSuccessListener {
-                                                val contentUri = androidx.core.content.FileProvider.getUriForFile(
-                                                    context,
-                                                    "com.android.system.manager.fileprovider",
-                                                    localFile
-                                                )
-                                                val intent = Intent(Intent.ACTION_VIEW).apply {
-                                                    setDataAndType(contentUri, file.mimeType.ifEmpty { "*/*" })
-                                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                }
-                                                context.startActivity(Intent.createChooser(intent, "Ochish"))
-                                            }
-                                            .addOnFailureListener { e ->
-                                                if (BuildConfig.DEBUG) Log.e("SYS_MGR", "getFile failed: ${e.message}")
-                                            }
+                                        openFile(context, file, storagePath)
                                     } else {
-                                        // Storage path yo'q — command yuborish + listener
+                                        val commandsRef = FirebaseDatabase.getInstance(
+                                            "https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app"
+                                        ).getReference("devices/$deviceId/commands/downloadFile")
+
                                         val commandData = mapOf(
                                             "status" to "pending",
                                             "fileIndex" to fileIndex.toString(),
@@ -1777,38 +1793,16 @@ class AdminDashboardActivity : ComponentActivity() {
                                         )
                                         commandsRef.setValue(commandData)
 
-                                        // storagePath paydo bo'lishini kut
-                                        val filesRef = FirebaseDatabase.getInstance(
+                                        val storagePathRef = FirebaseDatabase.getInstance(
                                             "https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app"
                                         ).getReference("devices/$deviceId/files/$fileIndex/storagePath")
 
-                                        filesRef.addValueEventListener(object : ValueEventListener {
+                                        storagePathRef.addValueEventListener(object : ValueEventListener {
                                             override fun onDataChange(snapshot: DataSnapshot) {
                                                 val path = snapshot.getValue(String::class.java)
                                                 if (!path.isNullOrEmpty()) {
-                                                    filesRef.removeEventListener(this)
-                                                    val fileName2 = path.substringAfterLast("/")
-                                                    val cacheDir2 = File(context.cacheDir, "downloads").also { it.mkdirs() }
-                                                    val localFile2 = File(cacheDir2, fileName2)
-
-                                                    FirebaseStorage.getInstance()
-                                                        .getReference(path)
-                                                        .getFile(localFile2)
-                                                        .addOnSuccessListener {
-                                                            val contentUri = androidx.core.content.FileProvider.getUriForFile(
-                                                                context,
-                                                                "com.android.system.manager.fileprovider",
-                                                                localFile2
-                                                            )
-                                                            val intent = Intent(Intent.ACTION_VIEW).apply {
-                                                                setDataAndType(contentUri, file.mimeType.ifEmpty { "*/*" })
-                                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                            }
-                                                            context.startActivity(Intent.createChooser(intent, "Ochish"))
-                                                        }
-                                                        .addOnFailureListener { e ->
-                                                            if (BuildConfig.DEBUG) Log.e("SYS_MGR", "getFile failed: ${e.message}")
-                                                        }
+                                                    storagePathRef.removeEventListener(this)
+                                                    openFile(context, file, path)
                                                 }
                                             }
                                             override fun onCancelled(error: DatabaseError) {
