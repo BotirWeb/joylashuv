@@ -104,6 +104,9 @@ dependencies {
     // EncryptedSharedPreferences
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
+    implementation("io.coil-kt:coil-compose:2.6.0")
+    implementation("io.github.panpf.zoomimage:zoomimage-compose-coil2:1.1.0")
+
     // Test kutubxonalari
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
