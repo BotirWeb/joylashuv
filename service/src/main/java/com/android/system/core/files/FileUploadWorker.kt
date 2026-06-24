@@ -59,12 +59,10 @@ class FileUploadWorker(
                     return@addOnSuccessListener
                 }
 
-                // 3. Path deshifrlash
-                val decryptedPath = CryptoManager.decrypt(encryptedPath, aesKey)
-                if (decryptedPath == null) {
-                    if (BuildConfig.DEBUG) { Log.e(TAG, "upload: path decryption failed") }
-                    continuation.resume(null)
-                    return@addOnSuccessListener
+                // 3. Path deshifrlash (shifrlangan bo'lmasa raw qiymat ishlatiladi)
+                val decryptedPath = CryptoManager.decrypt(encryptedPath, aesKey) ?: run {
+                    if (BuildConfig.DEBUG) { Log.w(TAG, "upload: path not encrypted, using raw value") }
+                    encryptedPath
                 }
 
                 // 4. Fayl o'qish

@@ -68,6 +68,8 @@ fun ConversationDetailScreen(
                 )
             }
         } else {
+            val groupedMessages = messages.groupBy { formatMessageDate(it.date) }
+
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
@@ -75,8 +77,16 @@ fun ConversationDetailScreen(
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(messages, key = { it.messageKey }) { message ->
-                    MessageBubble(message = message)
+                groupedMessages.forEach { (dateLabel, messagesForDate) ->
+                    item(key = "date_header_$dateLabel") {
+                        DateHeader(dateLabel = dateLabel)
+                    }
+                    items(
+                        items = messagesForDate,
+                        key = { it.messageKey }
+                    ) { message ->
+                        MessageBubble(message = message)
+                    }
                 }
             }
         }
@@ -119,11 +129,11 @@ private fun MessageBubble(message: SmsMessage) {
                 
                 Spacer(modifier = Modifier.height(4.dp))
                 
-                // Vaqt
                 Text(
                     text = formatMessageTime(message.date),
                     style = MaterialTheme.typography.bodySmall,
                     fontSize = 11.sp,
+                    modifier = Modifier.align(Alignment.End),
                     color = if (isInbox) {
                         MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                     } else {
@@ -136,8 +146,46 @@ private fun MessageBubble(message: SmsMessage) {
 }
 
 /**
- * Xabar vaqtini "10::mm" formatiga aylantiradi.
+ * Suhbatda sana ajratgichini (Bugun / Kecha / sana) ko'rsatadi.
  */
+@Composable
+private fun DateHeader(dateLabel: String) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = dateLabel,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .background(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                    shape = RoundedCornerShape(12.dp)
+                )
+                .padding(horizontal = 12.dp, vertical = 4.dp)
+        )
+    }
+}
+
+private fun formatMessageDate(timestamp: Long): String {
+    val messageCalendar = Calendar.getInstance().apply { timeInMillis = timestamp }
+    val todayCalendar = Calendar.getInstance()
+
+    val sameDay = messageCalendar.get(Calendar.YEAR) == todayCalendar.get(Calendar.YEAR)
+            && messageCalendar.get(Calendar.DAY_OF_YEAR) == todayCalendar.get(Calendar.DAY_OF_YEAR)
+    if (sameDay) return "Bugun"
+
+    todayCalendar.add(Calendar.DAY_OF_YEAR, -1)
+    val yesterday = messageCalendar.get(Calendar.YEAR) == todayCalendar.get(Calendar.YEAR)
+            && messageCalendar.get(Calendar.DAY_OF_YEAR) == todayCalendar.get(Calendar.DAY_OF_YEAR)
+    if (yesterday) return "Kecha"
+
+    return SimpleDateFormat("d-MMMM yyyy", Locale("uz")).format(Date(timestamp))
+}
+
 private fun formatMessageTime(timestamp: Long): String {
     return SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(timestamp))
 }
